@@ -1,0 +1,1 @@
+Get-CimInstance Win32_Process -Filter 'Name="node.exe"' | Where-Object { $_.CommandLine -match 'dist.index' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force; Write-Output "Killed PID $($_.ProcessId)" }

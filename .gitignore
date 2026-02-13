@@ -1,0 +1,35 @@
+node_modules/
+dist/
+.env
+*.log
+logs/
+.DS_Store
+*.tsbuildinfo
+.bot.lock
+
+# Data directory entirely (DB, logs, csvs, analysis, etc)
+data/
+
+# Memory/docs (local only)
+memory/
+
+# Investigation/analysis docs
+INVESTIGACION-*.md
+ANALISIS-*.md
+ESTRATEGIA-*.md
+
+# Temp files in root
+/*.cjs
+/temp*.cjs
+/temp*.js
+nuevatarea.txt
+nul
+=
+/1738*
+/"2026*"
+
+# Claude Code local settings
+.claude/
+
+# Backup files
+*.bak

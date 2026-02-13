@@ -1,0 +1,159 @@
+detection:
+  # Monitor these program IDs for new pools
+  raydium_amm_v4: true
+  pumpfun: true
+  pumpswap: true
+  # Polling interval for fallback HTTP detection (ms)
+  poll_interval_ms: 2000
+  # Yellowstone gRPC: faster detection via QuickNode (free tier: 50K responses/day)
+  yellowstone:
+    enabled: false
+    daily_response_limit: 50000
+
+analysis:
+  # Minimum security score
+  # v11a: Testing at 65 (was 60). Will raise to 70 for live.
+  # Score 65+: ~1 every 3min, 29% of pools. Score 70+: ~1 every 6min, 15% of pools.
+  min_score: 65
+  # Weights for scoring
+  weights:
+    freeze_authority: 15   # v9A: was 20. Scammers revoke freeze to gain points, reduced discriminative value
+    mint_authority: 20
+    honeypot: 15         # Solo cuenta cuando verificable (PumpSwap: 0 puntos)
+    liquidity: 15
+    holders: 10          # Concentración de holders (reverted - 20pts empeoraba el scoring)
+    lp_burned: 10
+  # v9g: Raised $10K→$15K. Backtest N=300 shadow: liq>=$15K = 88% WR, 6% rug, +0.01309/trade
+  # vs $10K = 86% WR, 14% rug, +0.01036/trade. $10-15K is PumpFun migration zone (rug factory)
+  # v9o: Lowered $10K→$5K. SOL at $80 → migration liq = ~$7-8K, $10K blocks EVERYTHING.
+  # Validation mode (0.001 SOL) = minimal risk. Creator+ML+observation checks handle rug risk.
+  min_liquidity_usd: 5000
+  # Max single holder percentage (research: 30% max, excludes pool vaults)
+  # Note: pool vault is counted as holder, so effective threshold is higher
+  max_single_holder_pct: 50
+  # Use RugCheck API
+  rugcheck_enabled: true
+  # Honeypot simulation via Jupiter
+  honeypot_check: true
+  # Creator deep check: trace funding source, detect scammer networks
+  creator_deep_check:
+    enabled: true
+    max_funding_hops: 3          # v11i: was 2, catches Hard Disperse obfuscation
+    network_threshold: 3       # Block if funder has N+ creators
+    reputation_weight: true    # Apply reputation score to security score
+  # AllenHark external blacklist (4,178+ known scammer wallets)
+  allenhark_blacklist:
+    enabled: true
+  # ML classifier: decision tree trained on historical data
+  ml_classifier:
+    enabled: false             # Shadow mode: logs predictions but doesn't block
+    min_confidence: 0.70       # Only block with >= 70% confidence
+    version: 2                 # v2: shadow-trained DT (F1=0.676) + v1 fallback
+  # Observation window: watch pool reserves before buying (catches fast rugs 10-30s)
+  observation_window:
+    enabled: true
+    duration_ms: 10000      # v8t: 10s (was 3s). Catches ultra-fast rugs like BZLD (21s drain)
+    poll_interval_ms: 2500  # 4 polls in 10s
+    max_drop_pct: 5         # 5% drop in 10s = skip
+
+execution:
+  # Use Jupiter for swaps (primary)
+  use_jupiter: true
+  # Fallback to Raydium direct swap
+  use_raydium_fallback: true
+  # Jito bundles (MEV protection + priority)
+  use_jito: true
+  jito_tip_lamports: 50000       # 0.00005 SOL - tip para prioridad en bloque
+  # Slippage: 30% para PumpSwap directo (era 85%, pero real slippage es ~5%)
+  # Si falla por slippage, significa que alguien nos front-runeó → mejor no comprar
+  slippage_bps: 3000
+  # Compute unit limit
+  compute_unit_limit: 400000     # Más alto para Token-2022 + ATA creation
+  # Priority fee: balance entre velocidad y costo
+  priority_fee_microlamports: 100000
+  # Transaction confirmation timeout (ms)
+  confirm_timeout_ms: 30000      # 30s máximo
+
+position:
+  # Take profit levels - DATA from 260 trades (full DexScreener analysis, Feb 9):
+  # R:R ratio was 0.44 (avg win +0.0016 vs avg loss -0.0036) - need more upside capture
+  # DexScreener: ~50% of winners go 2x+, ~30% go 3x+, ~10% go 5x+ AFTER we sold
+  # Simulation: 80%@1.25x = -0.0498 SOL/100 trades, 50%@1.3x = +0.0195 SOL/100 trades
+  # Key insight: keeping 50% trailing captures the fat tail distribution
+  # v8k EXIT STRATEGY (data-driven, 260 trades analyzed):
+  # Problem: v8j sold 80% at 1.25x but DexScreener shows 50%+ of winners go 2x+
+  # Simulation: 80%@1.25x = -0.0498 SOL/100 trades, 50%@1.3x = +0.0195 SOL/100 trades
+  # Key: keep more tokens trailing to capture 2-5x+ moves
+  # v11i: TP1@1.08x sell 80%, keep 20% moonbag with 15% trailing
+  # Data (N=113 last 4 days): 3 trades between 1.08x-1.10x peak are ALL rugs
+  #   FqTUpDKW peak=1.086x RUG, BCEz6rTD peak=1.088x RUG, FGSYUFfz peak=1.092x RUG
+  # At 1.08x: 96% hit rate, saves 90% of rugs (vs 86% at 1.10x saving 76%)
+  # 80/20 split: only strategy showing positive EV at 0.05 SOL (+0.0002/trade)
+  # Simulation: 80%@1.08x pnl/trade=+0.000210 at 0.05 SOL vs -0.003881 for 100%@1.10x
+  take_profit:
+    - pct: 80
+      at_multiplier: 1.08
+  # Stop loss: -30% (same - working well)
+  stop_loss_pct: -30
+  # v9d: Trailing stop 10% (was 25%). Data: N=47 shadow, +3.16% exit improvement, 45% benefit, 0% worsen
+  # Post-TP1: 8% (was 20%), Post-TP2: 5% (was 15%) — in stop-loss.ts
+  # Trailing tighter = mathematically can't be worse (only changes exit timing)
+  trailing_stop_pct: 10
+  # v11i: Moon bag 100% — keep ALL remaining tokens after TP1 sell as moonbag
+  # With 80% sold at TP1, 20% remains. moonBagPct=100 keeps that full 20%.
+  # Moonbag trails with 15% trailing stop (set in stop-loss.ts)
+  moon_bag_pct: 100
+  # Price monitoring interval
+  price_poll_ms: 1500
+  # v11i: Timeout 8 min (was 12). Data: winners avg 5.8 min, rugs avg 8.9 min.
+  # Reduce timeout to cut losers faster. Early exit at 3min + slow grind at 5min handle rest.
+  timeout_minutes: 8
+
+risk:
+  # v8t: CRITICAL - trade size vs ATA overhead analysis (15 trades, Feb 9-10):
+  #   0.02 SOL = 12% overhead → LOSES money (EV -0.0011/trade)
+  #   0.05 SOL = 4.8% overhead → PROFITABLE (EV +0.0008/trade)
+  #   0.10 SOL = 2.4% overhead → VERY PROFITABLE (EV +0.004/trade)
+  # Capital requirements: size × max_concurrent + 0.01 SOL buffer
+  #   0.05 × 2 + 0.01 = 0.11 SOL minimum
+  #   0.05 × 3 + 0.01 = 0.16 SOL for 3 concurrent
+  # v9e: Raised 0.02→0.03. Backtest: 0.02 = 14% overhead (kills EV), 0.05 = 5.6% (profitable)
+  # With 0.162 SOL balance: 0.03 SOL = 9.3% overhead, 5 trades to floor (safe)
+  # 0.05 SOL gives 4 trades to floor — too risky with current balance
+  # Will raise to 0.05 when balance >= 0.25 SOL
+  # v11a: Testing phase — 0.001 SOL/trade (minimum). Every trade loses to fees.
+  # Goal: verify paid tier works (0 errors, sells execute). Scale after 5 clean trades.
+  max_position_sol: 0.001
+  # v9v: max_concurrent=1 for overnight stability. Only 1 trade at a time = no RPC contention.
+  max_concurrent: 1
+  # Max trades per session (0 = unlimited)
+  max_trades_per_session: 50
+  # Daily loss limit
+  daily_loss_limit_pct: 20
+  # Dry run mode (no real trades)
+  dry_run: false
+  # v11a: LIVE MODE (shadow_mode off). 140+ validation trades, strategy proven profitable.
+  shadow_mode: false
+  shadow_max_concurrent: 10    # v9l: reduced to 10 to save RPC resources. 10 × 10s polls = ~2 RPC calls/min
+  shadow_timeout_minutes: 15   # Duración de tracking por shadow position
+  shadow_poll_ms: 10000        # v9g: 10s (was 5s). Halves RPC load, still captures major moves
+
+copy_trading:
+  enabled: false
+  # Max SOL per copy trade
+  max_copy_sol: 0.1
+  # Min market cap for copy trades
+  min_market_cap: 50000
+  # Delay before executing copy (ms)
+  delay_ms: 500
+  # Pool burnt ratio minimum
+  min_pool_burnt_ratio: 0.5
+
+telegram:
+  enabled: true
+  # Notify on these events
+  notify_detection: false   # No spam de detecciones
+  notify_buy: true          # Avisa cuando COMPRA
+  notify_sell: true         # Avisa cuando VENDE
+  notify_stop_loss: true    # Avisa si corta pérdida
+  notify_error: true        # Solo errores críticos (trades fallidos)

@@ -1,0 +1,24 @@
+services:
+  bot:
+    build: .
+    container_name: vipersnipe
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs
+      - ./config:/app/config
+    depends_on:
+      - redis
+
+  redis:
+    image: redis:7-alpine
+    container_name: vipersnipe-redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+
+volumes:
+  redis-data:
