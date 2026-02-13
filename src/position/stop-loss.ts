@@ -115,17 +115,14 @@ export function evaluateStopLoss(
   }
 
   // Timeout - extended by TP hits (confirmed winners get more time)
-  // C2: Moon bag 3x, TP2+ = +5min, TP1 = +2min, base = timeoutMinutes
+  // v11i: Moonbag gets 2x timeout for upside capture. Breakeven floor (1.0x) handles downside.
   if (timeoutMinutes > 0) {
     let effectiveTimeout: number;
-    if (position.status === 'partial_close' && position.tpLevelsHit.length >= 2) {
-      // Moon bag after TP2+: 3x timeout
-      effectiveTimeout = timeoutMinutes * 3;
-    } else if (position.tpLevelsHit.length >= 2) {
-      // TP2+ hit: +5 min bonus
-      effectiveTimeout = timeoutMinutes + 5;
+    if (position.status === 'partial_close' && position.tpLevelsHit.length >= 1) {
+      // v11i: Moonbag — 2x timeout for moonshot capture (breakeven floor protects downside)
+      effectiveTimeout = timeoutMinutes * 2;
     } else if (position.tpLevelsHit.length >= 1) {
-      // v8j: TP1-only gets NO timeout bonus (was +2min). Data: 6/6 winners exit by timeout, wasting 2 extra min
+      // Post-TP non-moonbag: no bonus
       effectiveTimeout = timeoutMinutes;
     } else {
       effectiveTimeout = timeoutMinutes;

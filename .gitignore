@@ -7,8 +7,8 @@ logs/
 *.tsbuildinfo
 .bot.lock
 
-# Data directory entirely (DB, logs, csvs, analysis, etc)
-data/
+# Data directory entirely (DB, logs, csvs, analysis, etc) — /data/ = root only, not src/data/
+/data/
 
 # Memory/docs (local only)
 memory/
