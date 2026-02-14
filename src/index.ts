@@ -209,7 +209,8 @@ async function main(): Promise<void> {
         logger.warn(`[wallet] Balance check failed (non-fatal): ${String(err).slice(0, 100)}`);
       }
       // v9w: Start background balance updater (30s interval, uses backup RPCs)
-      startBalanceUpdater(wallet.publicKey, rpcManager.connection);
+      // v11j: Pass getter function so balance updater always uses fresh connection after reset
+      startBalanceUpdater(wallet.publicKey, () => rpcManager.primaryConnection);
     }
   }
 
@@ -274,6 +275,22 @@ async function main(): Promise<void> {
         );
       }
     }
+  }
+
+  // v11j: Recreate swap executors when RPC connection resets (they cache Connection internally)
+  // Since these vars are `let`, the closures in executeBuy/executeSell read the latest reference.
+  if (wallet && !detectionOnly) {
+    rpcManager.onConnectionReset(() => {
+      logger.info('[rpc] Connection reset — recreating swap executors with fresh Connection');
+      pumpSwapSwap = new PumpSwapSwap(rpcManager.connection, wallet!);
+      if (!config.risk.shadowMode) {
+        jupiterSwap = new JupiterSwap(rpcManager.connection, wallet!);
+        raydiumSwap = new RaydiumSwap(rpcManager.connection, wallet!);
+        if (config.execution.useJito) {
+          jitoBundler = new JitoBundler(rpcManager.connection, wallet!, config.jito.blockEngineUrl);
+        }
+      }
+    });
   }
 
   // Buy function used by position manager and copy executor

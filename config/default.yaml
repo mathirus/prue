@@ -123,7 +123,7 @@ risk:
   # Will raise to 0.05 when balance >= 0.25 SOL
   # v11a: Testing phase — 0.001 SOL/trade (minimum). Every trade loses to fees.
   # Goal: verify paid tier works (0 errors, sells execute). Scale after 5 clean trades.
-  max_position_sol: 0.001
+  max_position_sol: 0.005
   # v9v: max_concurrent=1 for overnight stability. Only 1 trade at a time = no RPC contention.
   max_concurrent: 1
   # Max trades per session (0 = unlimited)
