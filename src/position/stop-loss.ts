@@ -50,15 +50,17 @@ export function evaluateStopLoss(
   }
 
   // Trailing stop loss
-  // v11i: Moonbag (partial_close after TP1) gets 15% trailing with low activation (1.04x)
+  // v11k: Moonbag (partial_close after TP) gets 10% trailing with low activation (1.04x)
+  // Was 15% in v11i — too loose: 7JAV peaked at 2.189x, dropped to 1.909x (-12.8%) but
+  // 15% trailing didn't trigger. Pool rugged before trigger. 10% would have sold at 1.97x.
   // Other positions: 12% activation, config-based trailing
   const isMoonbag = position.status === 'partial_close' && position.tpLevelsHit.length >= 1;
   const minTrailingActivation = isMoonbag ? 1.04 : 1.12;
   let effectiveTrailingPct: number;
   if (isMoonbag) {
-    // v11i: Moonbag — 15% trailing for upside capture
-    // Data: winners reach 1.3-2x after TP1, 15% gives room to ride while protecting gains
-    effectiveTrailingPct = 15;
+    // v11k: Moonbag — 10% trailing (was 15%). Tighter to lock in gains before rugs.
+    // Data: 7JAV 15% didn't trigger (only -12.8% drop), 10% would have saved moon bag
+    effectiveTrailingPct = 10;
   } else if (position.tpLevelsHit.length >= 1) {
     effectiveTrailingPct = Math.min(trailingStopPct, 8); // Post-TP1 non-moonbag: tight 8%
   } else {

@@ -84,24 +84,29 @@ position:
   # Problem: v8j sold 80% at 1.25x but DexScreener shows 50%+ of winners go 2x+
   # Simulation: 80%@1.25x = -0.0498 SOL/100 trades, 50%@1.3x = +0.0195 SOL/100 trades
   # Key: keep more tokens trailing to capture 2-5x+ moves
-  # v11i: TP1@1.08x sell 80%, keep 20% moonbag with 15% trailing
+  # v11i: TP1@1.08x sell 80%, keep 20% moonbag with trailing
   # Data (N=113 last 4 days): 3 trades between 1.08x-1.10x peak are ALL rugs
   #   FqTUpDKW peak=1.086x RUG, BCEz6rTD peak=1.088x RUG, FGSYUFfz peak=1.092x RUG
   # At 1.08x: 96% hit rate, saves 90% of rugs (vs 86% at 1.10x saving 76%)
   # 80/20 split: only strategy showing positive EV at 0.05 SOL (+0.0002/trade)
   # Simulation: 80%@1.08x pnl/trade=+0.000210 at 0.05 SOL vs -0.003881 for 100%@1.10x
+  # v11k: Added TP2@2.0x sell 50% of remaining (10% of original)
+  # Data: 7JAV peaked at 2.189x for 23s, no TP2 → pool rugged → moon bag lost
+  # TP2 would have locked in profit on half the moon bag before the rug
   take_profit:
     - pct: 80
       at_multiplier: 1.08
+    - pct: 50
+      at_multiplier: 2.0
   # Stop loss: -30% (same - working well)
   stop_loss_pct: -30
   # v9d: Trailing stop 10% (was 25%). Data: N=47 shadow, +3.16% exit improvement, 45% benefit, 0% worsen
   # Post-TP1: 8% (was 20%), Post-TP2: 5% (was 15%) — in stop-loss.ts
   # Trailing tighter = mathematically can't be worse (only changes exit timing)
   trailing_stop_pct: 10
-  # v11i: Moon bag 100% — keep ALL remaining tokens after TP1 sell as moonbag
-  # With 80% sold at TP1, 20% remains. moonBagPct=100 keeps that full 20%.
-  # Moonbag trails with 15% trailing stop (set in stop-loss.ts)
+  # v11k: Moon bag 100% — keep ALL remaining tokens after last TP sell as moonbag
+  # After TP1 (80%) + TP2 (50% of remaining), 10% of original remains as moonbag.
+  # Moonbag trails with 10% trailing stop (set in stop-loss.ts, was 15% pre-v11k)
   moon_bag_pct: 100
   # Price monitoring interval
   price_poll_ms: 1500
