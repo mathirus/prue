@@ -78,12 +78,13 @@ export class ShadowPositionManager {
 
   constructor(
     private readonly config: BotConfig,
-    connection: Connection,
+    getConnection: (() => Connection) | Connection,
     private readonly liqMonitor?: LiquidityRemovalMonitor,
   ) {
     this.maxConcurrent = config.risk.shadowMaxConcurrent;
     this.timeoutMs = config.risk.shadowTimeoutMinutes * 60 * 1000;
-    this.priceMonitor = new PriceMonitor(config.risk.shadowPollMs, connection);
+    const connGetter = typeof getConnection === 'function' ? getConnection : () => getConnection;
+    this.priceMonitor = new PriceMonitor(config.risk.shadowPollMs, connGetter);
     this.tradeLogger = new TradeLogger();
 
     // Price updates

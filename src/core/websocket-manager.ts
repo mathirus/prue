@@ -26,10 +26,15 @@ export class WebSocketManager {
   // 90s without callbacks on a SPECIFIC subscription = stale for that subscription
   private static readonly STALE_TIMEOUT_MS = 90 * 1000;
 
+  private readonly getConnection: () => Connection;
   constructor(
     private connection: Connection,
     private readonly wsUrl: string,
-  ) {}
+    getConn?: () => Connection,
+  ) {
+    // v11j: Optional getter for fresh Connection (used by heartbeat getSlot)
+    this.getConnection = getConn || (() => this.connection);
+  }
 
   // v11g: Register alert callback (for Telegram notifications)
   onAlert(callback: WsAlertCallback): void {
@@ -107,7 +112,7 @@ export class WebSocketManager {
         this.sendAlert(alertMsg);
 
         try {
-          await this.connection.getSlot();
+          await this.getConnection().getSlot();
           // HTTP works, WS partially/fully dead → reconnect
           this.isConnected = false;
           await this.reconnectAll();

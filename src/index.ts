@@ -174,7 +174,7 @@ async function main(): Promise<void> {
   rpcManager.startHealthChecks();
 
   // Setup WebSocket
-  const wsManager = new WebSocketManager(rpcManager.primaryConnection, config.rpc.wsUrl);
+  const wsManager = new WebSocketManager(rpcManager.primaryConnection, config.rpc.wsUrl, () => rpcManager.primaryConnection);
   wsManager.startHeartbeat();
 
   // Setup cache
@@ -182,7 +182,7 @@ async function main(): Promise<void> {
   await cache.init();
 
   // v8s: Start blockhash pre-cache (refreshes every 400ms, saves 100-300ms per TX)
-  startBlockhashCache(rpcManager.connection);
+  startBlockhashCache(() => rpcManager.primaryConnection);
 
   // Setup wallet
   let wallet: Wallet | undefined;
@@ -215,7 +215,7 @@ async function main(): Promise<void> {
   }
 
   // Setup scorer
-  const scorer = new TokenScorer(rpcManager.connection, config);
+  const scorer = new TokenScorer(() => rpcManager.connection, config);
   const tradeLogger = new TradeLogger();
   const creatorTracker = new CreatorTracker();
   const scammerBlacklist = new ScammerBlacklist();
@@ -239,7 +239,7 @@ async function main(): Promise<void> {
     config.risk.shadowMaxConcurrent = Math.max(config.risk.shadowMaxConcurrent, 200);
     config.risk.shadowPollMs = Math.min(config.risk.shadowPollMs, 5000);
   }
-  shadowManager = new ShadowPositionManager(config, rpcManager.connection);
+  shadowManager = new ShadowPositionManager(config, () => rpcManager.connection);
   // v9h: Only start price polling in shadow mode. In live mode, shadow records entry + DexScreener only.
   if (config.risk.shadowMode) {
     shadowManager.start();
@@ -722,7 +722,7 @@ async function main(): Promise<void> {
   // Setup position manager (pass connection for PumpSwap price fallback)
   // In shadow mode, we still create it for the startup cleanup/status code to work,
   // but it won't receive any real positions
-  const positionManager = new PositionManager(config, executeSell, rpcManager.connection);
+  const positionManager = new PositionManager(config, executeSell, () => rpcManager.connection);
   if (!config.risk.shadowMode) {
     positionManager.start();
   }
@@ -1947,13 +1947,13 @@ async function main(): Promise<void> {
   const detectors: Array<{ start(): Promise<void>; stop(): Promise<void> }> = [];
 
   if (config.detection.raydiumAmmV4) {
-    detectors.push(new PoolDetector(rpcManager.primaryConnection, wsManager));
+    detectors.push(new PoolDetector(() => rpcManager.primaryConnection, wsManager));
   }
   if (config.detection.pumpfun) {
-    detectors.push(new PumpFunMonitor(rpcManager.primaryConnection, wsManager));
+    detectors.push(new PumpFunMonitor(() => rpcManager.primaryConnection, wsManager));
   }
   if (config.detection.pumpswap) {
-    detectors.push(new PumpSwapMonitor(rpcManager.primaryConnection, wsManager));
+    detectors.push(new PumpSwapMonitor(() => rpcManager.primaryConnection, wsManager));
   }
 
   // Yellowstone gRPC: faster detection (primary), WS monitors are fallback

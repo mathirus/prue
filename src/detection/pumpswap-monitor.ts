@@ -28,7 +28,7 @@ export class PumpSwapMonitor {
   private fetchQueue: Array<{ signature: string; slot: number; resolve: () => void }> = [];
 
   constructor(
-    private readonly connection: Connection,
+    private readonly getConnection: () => Connection,
     private readonly wsManager: WebSocketManager,
   ) {}
 
@@ -171,7 +171,7 @@ export class PumpSwapMonitor {
             maxSupportedTransactionVersion: 0,
             commitment: 'confirmed',
           }),
-          this.connection,
+          this.getConnection(),
           15_000, // v11g: 15s (was 10s). Argentina→USA latency: 500ms base + Helius load. User requested increase
           false, // v10c: Respect concurrency limiter — isSellPath=true caused self-DDoS when multiple pools arrived
         ).then(result => {

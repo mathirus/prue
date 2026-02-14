@@ -16,21 +16,21 @@ interface CachedBlockhash {
 
 let cache: CachedBlockhash | null = null;
 let refreshInterval: ReturnType<typeof setInterval> | null = null;
-let connection: Connection | null = null;
+let getConnection: (() => Connection) | null = null;
 let consecutiveFailures = 0;
 
 const REFRESH_MS = 1_000; // v11a: was 400ms. Saves ~4M credits/mo. Blockhash valid ~60s.
 const MAX_AGE_MS = 5_000; // Fetch fresh if cache older than 5s
 
 async function refresh(): Promise<void> {
-  if (!connection) return;
+  if (!getConnection) return;
   try {
-    // v9k: ALWAYS use analysis RPC pool for blockhash refresh.
-    // Before: called Helius primary every 400ms (2.5 calls/sec constant drain).
-    // After: distributed across Helius2/Alchemy/ExtrNode, Helius primary only as last resort.
+    // v11j: Call getter each time to get fresh Connection after RPC reset.
+    // Before: stored Connection reference → zombie requests after agent.destroy()
+    const conn = getConnection();
     const result = await withAnalysisRetry(
-      (conn) => conn.getLatestBlockhash('confirmed'),
-      connection,
+      (c) => c.getLatestBlockhash('confirmed'),
+      conn,
     );
     cache = {
       blockhash: result.blockhash,
@@ -46,9 +46,11 @@ async function refresh(): Promise<void> {
 
 /**
  * Start the blockhash pre-cache. Call once at bot startup.
+ * v11j: Accepts getter function instead of Connection reference.
+ * After RPC connection reset, the getter returns the fresh Connection automatically.
  */
-export function startBlockhashCache(conn: Connection): void {
-  connection = conn;
+export function startBlockhashCache(connGetter: () => Connection): void {
+  getConnection = connGetter;
   // Fetch initial blockhash immediately
   refresh().then(() => {
     if (cache) {
@@ -67,7 +69,7 @@ export function stopBlockhashCache(): void {
     refreshInterval = null;
   }
   cache = null;
-  connection = null;
+  getConnection = null;
 }
 
 /**

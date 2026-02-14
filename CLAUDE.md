@@ -408,6 +408,18 @@ Estos son descubrimientos validados con datos reales que guían todas las decisi
 - **Workaround actual**: aceptable porque es conservador (mejor vender que perder)
 - **TODO futuro**: agregar columnas a DB para persistir reserves
 
+### 9. TCP Connection Poisoning & 3-Layer RPC Defense (v11j)
+- **Problema**: RPC timeouts causan que las conexiones TCP se envenenen. El bot queda incapaz de vender por horas.
+- **Root cause**: `agentkeepalive` default tiene `timeout: 38s` — durante outages sostenidos, los sockets cuelgan y nunca se reciclan.
+- **Solución**: 3 capas de defensa implementadas en `rpc-manager.ts`:
+  - **Capa 1**: Custom HTTP agent con `timeout: 10s`, `socketActiveTTL: 60s` (force-recycle)
+  - **Capa 2**: Connection reset a 5+ fails consecutivos — `agent.destroy()` + nuevo Connection (cooldown 30s)
+  - **Capa 3**: AbortController fetch timeout de 8s absoluto por request
+- **Descubrimiento clave**: `globalThis.fetch` de Node.js 18+ **ignora silenciosamente** la opción `agent`. Hay que usar `node-fetch` v2 (CJS).
+- **Bug crítico asociado**: Módulos que guardan Connection directamente (`blockhash-cache`, `balance-cache`) siguen usando la Connection vieja después de reset → zombie requests via agent destruido → saturan red
+- **Fix**: Patrón getter function: `getConnection: () => Connection` en lugar de almacenar referencia directa
+- **Leccion**: Cualquier módulo que almacene una Connection debe usar getter function para sobrevivir resets.
+
 ---
 
 ## Reglas para Claude Code

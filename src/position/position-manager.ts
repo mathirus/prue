@@ -80,15 +80,15 @@ export class PositionManager {
   constructor(
     private readonly config: BotConfig,
     private readonly sellFn: SellFunction,
-    connection?: Connection,
+    getConnection?: () => Connection,
   ) {
-    this.priceMonitor = new PriceMonitor(config.position.pricePollMs, connection);
+    this.priceMonitor = new PriceMonitor(config.position.pricePollMs, getConnection);
     this.tradeLogger = new TradeLogger();
     this.creatorTracker = new CreatorTracker();
 
     // v8s: WebSocket-based liquidity removal monitor (detects rugs 2-10s before polling)
-    if (connection) {
-      this.liqMonitor = new LiquidityRemovalMonitor(connection);
+    if (getConnection) {
+      this.liqMonitor = new LiquidityRemovalMonitor(getConnection);
       this.liqMonitor.onLiquidityRemoved((poolAddr, mintStr, severity, burstCount) => {
         this.onLiquidityRemoved(poolAddr, mintStr, severity, burstCount);
       });

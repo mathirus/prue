@@ -64,9 +64,13 @@ async function withTimeout<T>(
  */
 export class TokenScorer {
   constructor(
-    private readonly connection: Connection,
+    private readonly getConnection: () => Connection,
     private readonly config: BotConfig,
   ) {}
+
+  private get connection(): Connection {
+    return this.getConnection();
+  }
 
   async score(pool: DetectedPool): Promise<SecurityResult> {
     const startTime = Date.now();

@@ -68,10 +68,17 @@ export class PriceMonitor {
   private fastPollMode = false;
   private fastPollInterval?: ReturnType<typeof setInterval>;
 
+  private readonly getConnection?: () => Connection;
   constructor(
     private readonly pollIntervalMs = 2000,
-    private readonly connection?: Connection,
-  ) {}
+    getConn?: () => Connection,
+  ) {
+    this.getConnection = getConn;
+  }
+
+  private get connection(): Connection | undefined {
+    return this.getConnection?.();
+  }
 
   onPriceUpdate(callback: PriceCallback): void {
     this.callbacks.push(callback);

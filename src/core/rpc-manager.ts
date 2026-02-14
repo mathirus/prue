@@ -81,7 +81,18 @@ export class RpcManager {
     const FETCH_TIMEOUT_MS = 8_000;
     return async (url: string | URL, init?: Record<string, unknown>): Promise<Response> => {
       const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
+      const start = Date.now();
+      const timer = setTimeout(() => {
+        const elapsed = Date.now() - start;
+        const agentStatus = agent.getCurrentStatus();
+        logger.warn(
+          `[rpc] FETCH TIMEOUT (${elapsed}ms): ${String(url).substring(0, 60)}... | ` +
+          `sockets: create=${agentStatus.createSocketCount} active=${Object.keys(agentStatus.sockets).length} ` +
+          `free=${Object.keys(agentStatus.freeSockets).length} total=${agentStatus.requestCount} ` +
+          `timeout=${agentStatus.timeoutSocketCount}`,
+        );
+        controller.abort();
+      }, FETCH_TIMEOUT_MS);
       try {
         return await nodeFetch(url, {
           ...init,
@@ -192,20 +203,31 @@ export class RpcManager {
           ep.latencyMs = Date.now() - start;
           ep.healthy = true;
           ep.failCount = 0;
-        } catch {
+        } catch (err) {
           ep.failCount++;
           ep.latencyMs = -1;
+          const hostname = new URL(ep.url).hostname;
+          const elapsed = Date.now() - start;
+          const errMsg = err instanceof Error ? err.message : String(err);
+          const agentStatus = ep.agent.getCurrentStatus();
+          if (ep.failCount >= 2) {
+            logger.error(
+              `[rpc] Endpoint fail: ${hostname} (${ep.failCount} consecutive, ${elapsed}ms) — ${errMsg} | ` +
+              `sockets: created=${agentStatus.createSocketCount} active=${Object.keys(agentStatus.sockets).length} ` +
+              `free=${Object.keys(agentStatus.freeSockets).length} total=${agentStatus.requestCount} ` +
+              `timeout=${agentStatus.timeoutSocketCount} close=${agentStatus.closeSocketCount}`,
+            );
+          }
           if (ep.failCount >= 3) {
             ep.healthy = false;
-            logger.error(`[rpc] Endpoint unhealthy: ${new URL(ep.url).hostname} (${ep.failCount} consecutive fails)`);
           }
         }
         ep.lastCheck = Date.now();
 
-        // v11j: Layer 2 — Connection reset at 5+ consecutive fails with 30s cooldown
-        // Destroys old agent (closes ALL sockets immediately) and creates fresh Connection.
-        // Replaces v10a auto-recover which only reset failCount but kept poisoned connections alive.
-        if (ep.failCount >= 5 && Date.now() - ep.lastConnectionReset >= 30_000) {
+        // v11j: Layer 2 — Connection reset at 3+ consecutive fails with 30s cooldown
+        // Lowered from 5 to 3: at 5 fails the agent socket pool is already saturated and
+        // all pending requests (pool parsing, blockhash, etc.) pile up. Reset ASAP.
+        if (ep.failCount >= 3 && Date.now() - ep.lastConnectionReset >= 30_000) {
           this.resetEndpointConnection(ep);
         }
       }
@@ -220,8 +242,13 @@ export class RpcManager {
   // v11j: Layer 2 — Destroy old agent + connection, create fresh ones
   private resetEndpointConnection(ep: RpcEndpoint): void {
     const hostname = new URL(ep.url).hostname;
+    const agentStatus = ep.agent.getCurrentStatus();
     logger.warn(
-      `[rpc] CONNECTION RESET: ${hostname} — ${ep.failCount} consecutive fails, destroyed old agent, created fresh Connection`,
+      `[rpc] CONNECTION RESET: ${hostname} — ${ep.failCount} consecutive fails | ` +
+      `sockets: created=${agentStatus.createSocketCount} active=${Object.keys(agentStatus.sockets).length} ` +
+      `free=${Object.keys(agentStatus.freeSockets).length} total=${agentStatus.requestCount} ` +
+      `timeout=${agentStatus.timeoutSocketCount} close=${agentStatus.closeSocketCount} | ` +
+      `destroying agent, creating fresh Connection`,
     );
 
     // Destroy old agent — closes ALL sockets immediately (no waiting for GC)

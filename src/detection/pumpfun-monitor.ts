@@ -27,7 +27,7 @@ export class PumpFunMonitor {
   private processedSignatures = new Set<string>();
 
   constructor(
-    private readonly connection: Connection,
+    private readonly getConnection: () => Connection,
     private readonly wsManager: WebSocketManager,
   ) {}
 
@@ -111,7 +111,7 @@ export class PumpFunMonitor {
 
       const fetchWithTimeout = (sig: string, timeoutMs = 5000) =>
         Promise.race([
-          this.connection.getParsedTransaction(sig, {
+          this.getConnection().getParsedTransaction(sig, {
             maxSupportedTransactionVersion: 0,
             commitment: 'confirmed',
           }),

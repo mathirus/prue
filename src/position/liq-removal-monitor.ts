@@ -43,7 +43,15 @@ export class LiquidityRemovalMonitor {
   private static readonly BURST_THRESHOLD = 8; // 8+ sells = likely rug dump
   private static readonly BURST_COOLDOWN_MS = 30_000; // 30s cooldown after burst trigger
 
-  constructor(private readonly connection: Connection) {}
+  private readonly getConnection: () => Connection;
+  constructor(getConn: (() => Connection) | Connection) {
+    // v11j: Accept getter function or direct Connection for backward compat
+    this.getConnection = typeof getConn === 'function' ? getConn : () => getConn;
+  }
+
+  private get connection(): Connection {
+    return this.getConnection();
+  }
 
   /**
    * Register callback for liquidity removal events.
