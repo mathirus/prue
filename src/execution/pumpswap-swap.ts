@@ -77,13 +77,19 @@ const JITO_TX_ENDPOINTS = [
   'https://frankfurt.mainnet.block-engine.jito.wtf/api/v1/transactions?bundleOnly=true',
 ];
 
-// v11a: Backup RPCs for sell-path redundancy (independent infrastructure from Helius)
+// v11k: Backup RPCs for sell-path redundancy (independent infrastructure from Helius)
 // Only used for sell path (~5 sells/hour max = no rate limit issues on free tier)
-const SELL_BACKUP_RPCS = [
+// Reads ALCHEMY_RPC_URL and QUICKNODE_RPC_URL from env for paid-tier backup (faster, more reliable)
+const SELL_BACKUP_RPCS: string[] = [];
+if (process.env.ALCHEMY_RPC_URL) SELL_BACKUP_RPCS.push(process.env.ALCHEMY_RPC_URL);
+if (process.env.QUICKNODE_RPC_URL) SELL_BACKUP_RPCS.push(process.env.QUICKNODE_RPC_URL);
+// Always include free-tier public RPCs as last resort
+SELL_BACKUP_RPCS.push(
   'https://api.mainnet-beta.solana.com',    // Solana Foundation
   'https://solana-rpc.publicnode.com',       // PublicNode (independent infra)
-];
+);
 const sellBackupConnections = SELL_BACKUP_RPCS.map(url => new Connection(url, 'confirmed'));
+logger.info(`[pumpswap] Sell backup RPCs: ${SELL_BACKUP_RPCS.length} endpoints (${SELL_BACKUP_RPCS.length - 2} paid + 2 public)`);
 
 // v11g: Helius Sender URL (staked connections, SWQOS-only)
 let _senderUrl: string | null | undefined;
@@ -930,28 +936,23 @@ export class PumpSwapSwap {
       const poolAddress = poolAddressOverride || PumpSwapSwap.derivePoolAddress(tokenMint);
       logger.info(`[pumpswap-sell] Selling ${tokenMint.toBase58().slice(0, 8)}... pool=${poolAddress.toBase58().slice(0, 8)}...`);
 
-      // v9x: Use cached pool state first (saves 1 RPC per sell — pool structure doesn't change)
-      // v11a: withSellBackup tries Helius, then backup RPCs if Helius is down
+      // v11k: Use cached pool state first (pool structure doesn't change, saves RPC on retries)
+      // Parallel backup: fire Helius + backup RPCs simultaneously if cache miss
       let poolState = this.getCachedPoolState(poolAddress);
       if (!poolState) {
         try {
-          poolState = await this.getPoolState(poolAddress, true);
-        } catch { /* primary failed */ }
-        // v11a: Backup RPC for sell-critical pool state
-        if (!poolState) {
-          for (const backup of sellBackupConnections) {
-            try {
-              logger.warn('[pumpswap-sell] Pool state via Helius failed, trying backup RPC...');
-              const accountInfo = await Promise.race([
-                backup.getAccountInfo(poolAddress),
-                new Promise<never>((_, rej) => setTimeout(() => rej(new Error('backup timeout')), 8_000)),
-              ]);
-              if (accountInfo?.data) {
-                poolState = this.parsePoolData(accountInfo.data);
-                if (poolState) { logger.info('[pumpswap-sell] Pool state recovered via backup RPC'); break; }
-              }
-            } catch (err) { logger.debug(`[pumpswap-sell] Backup pool state failed: ${err}`); }
+          const accountInfo = await this.withSellBackup(
+            (conn) => conn.getAccountInfo(poolAddress),
+          );
+          if (accountInfo?.data) {
+            poolState = this.parsePoolData(accountInfo.data);
           }
+        } catch (err) {
+          logger.warn(`[pumpswap-sell] All RPCs failed for pool state: ${err}`);
+        }
+        // v11k: Cache the pool state for subsequent sell retries (saves RPC on retry)
+        if (poolState) {
+          this.poolStateCache.set(poolAddress.toBase58(), { state: poolState, timestamp: Date.now() });
         }
       }
       if (!poolState) {
@@ -991,61 +992,78 @@ export class PumpSwapSwap {
         [Buffer.from('fee_config'), FEE_CONFIG_MAGIC], PUMPSWAP_FEE_PROGRAM,
       );
 
-      // Fetch reserves + blockhash in parallel
-      // v8s: blockhash from pre-cache (0ms vs 100-300ms RPC call)
-      // v11a: withSellBackup for reserves (Helius -> backup RPC fallback)
-      const [reserves, blockInfo] = await Promise.all([
-        this.withSellBackup((conn) => this.getReservesFromConn(
-          poolState!.poolBaseTokenAccount, poolState!.poolQuoteTokenAccount, conn,
-        )),
+      // v11k: Batch ALL sell-path account reads into ONE RPC call (saves 1-2 round trips)
+      // Reserves (vaults) + ATAs + blockhash all in parallel
+      const feeMint = poolState.quoteMint;
+      // Pre-derive fee ATAs assuming TOKEN_PROGRAM_ID (99% of pools)
+      const [creatorVaultAtaPreDerived, protocolFeeAtaPreDerived] = await Promise.all([
+        getAssociatedTokenAddress(feeMint, creatorVaultAuthority, true, TOKEN_PROGRAM_ID),
+        getAssociatedTokenAddress(feeMint, PUMPSWAP_PROTOCOL_FEE_RECIPIENT, true, TOKEN_PROGRAM_ID),
+      ]);
+
+      // v10d: Check cancel flag before expensive RPC calls
+      if (cancelFlag?.cancelled) {
+        return this.failResult(tokenAmount, 'Cancelled: parallel sell already succeeded');
+      }
+
+      // ONE batch fetch: vaults (reserves + token program) + all 4 ATAs + blockhash
+      const [batchInfos, blockInfo] = await Promise.all([
+        this.withSellBackup((conn) => conn.getMultipleAccountsInfo([
+          poolState!.poolBaseTokenAccount,   // [0] base vault → reserves + token program
+          poolState!.poolQuoteTokenAccount,  // [1] quote vault → reserves + token program
+          userWsolAta,                        // [2] user WSOL ATA
+          userTokenAta,                       // [3] user Token ATA
+          creatorVaultAtaPreDerived,          // [4] creator vault ATA
+          protocolFeeAtaPreDerived,           // [5] protocol fee ATA
+        ])),
         getCachedBlockhash(this.connection),
       ]);
 
-      if (!reserves) {
+      const baseVaultInfo = batchInfos[0];
+      const quoteVaultInfo = batchInfos[1];
+      if (!baseVaultInfo || !quoteVaultInfo) {
         return this.failResult(tokenAmount, 'Failed to get pool reserves');
       }
+
+      const reserves = {
+        baseReserve: Number(baseVaultInfo.data.readBigUInt64LE(64)),
+        quoteReserve: Number(quoteVaultInfo.data.readBigUInt64LE(64)),
+        baseTokenProgram: baseVaultInfo.owner,
+        quoteTokenProgram: quoteVaultInfo.owner,
+      };
 
       // Token program detection
       const baseTokenProgramId = reserves.baseTokenProgram;
       const quoteTokenProgramId = reserves.quoteTokenProgram;
       const tokenProgramId = isReversed ? quoteTokenProgramId : baseTokenProgramId;
-
-      // Fee ATAs: fee = quoteMint ALWAYS (both buy and sell)
-      // - Reversed (quoteMint=TOKEN): fee in TOKEN using quoteTokenProgramId
-      // - Standard (quoteMint=WSOL): fee in WSOL using TOKEN_PROGRAM_ID
-      const feeMint = poolState.quoteMint;
       const feeTokenProgram = quoteTokenProgramId;
-      const protocolFeeAta = await getAssociatedTokenAddress(
-        feeMint, PUMPSWAP_PROTOCOL_FEE_RECIPIENT, true, feeTokenProgram,
-      );
-      const creatorVaultAta = await getAssociatedTokenAddress(
-        feeMint, creatorVaultAuthority, true, feeTokenProgram,
-      );
 
-      // Re-derive TOKEN ATA if Token-2022
-      if (!tokenProgramId.equals(TOKEN_PROGRAM_ID)) {
-        logger.info(`[pumpswap-sell] Token uses Token-2022`);
-        userTokenAta = await getAssociatedTokenAddress(
-          isReversed ? poolState.quoteMint : poolState.baseMint,
-          this.wallet.publicKey, false, tokenProgramId,
-        );
-        if (isReversed) {
-          userQuoteAta = userTokenAta;
-        } else {
-          userBaseAta = userTokenAta;
+      let creatorVaultAta = creatorVaultAtaPreDerived;
+      let protocolFeeAta = protocolFeeAtaPreDerived;
+      let ataInfos = [batchInfos[2], batchInfos[3], batchInfos[4], batchInfos[5]];
+
+      // Re-derive ATAs if Token-2022 (rare, <1% of tokens)
+      if (!tokenProgramId.equals(TOKEN_PROGRAM_ID) || !feeTokenProgram.equals(TOKEN_PROGRAM_ID)) {
+        logger.info(`[pumpswap-sell] Token uses Token-2022 — re-deriving ATAs`);
+        if (!tokenProgramId.equals(TOKEN_PROGRAM_ID)) {
+          userTokenAta = await getAssociatedTokenAddress(
+            isReversed ? poolState.quoteMint : poolState.baseMint,
+            this.wallet.publicKey, false, tokenProgramId,
+          );
+          if (isReversed) userQuoteAta = userTokenAta;
+          else userBaseAta = userTokenAta;
         }
+        if (!feeTokenProgram.equals(TOKEN_PROGRAM_ID)) {
+          [creatorVaultAta, protocolFeeAta] = await Promise.all([
+            getAssociatedTokenAddress(feeMint, creatorVaultAuthority, true, feeTokenProgram),
+            getAssociatedTokenAddress(feeMint, PUMPSWAP_PROTOCOL_FEE_RECIPIENT, true, feeTokenProgram),
+          ]);
+        }
+        // Re-fetch ATAs with correct addresses (only for Token-2022)
+        ataInfos = await this.withSellBackup(
+          (conn) => conn.getMultipleAccountsInfo([userWsolAta, userTokenAta, creatorVaultAta, protocolFeeAta]),
+        ) as any;
       }
-
-      // v10d: Check cancel flag before expensive RPC calls — parallel sell may have already succeeded
-      if (cancelFlag?.cancelled) {
-        return this.failResult(tokenAmount, 'Cancelled: parallel sell already succeeded');
-      }
-
-      // Check ATA existence + get actual token balance (v8t: include protocolFeeAta)
-      // v11a: withSellBackup — tries Helius, falls back to backup RPCs
-      const ataInfos = await this.withSellBackup(
-        (conn) => conn.getMultipleAccountsInfo([userWsolAta, userTokenAta, creatorVaultAta, protocolFeeAta]),
-      );
 
       // Query actual token balance from ATA (handles Token-2022 transfer fees)
       let actualTokenAmount = tokenAmount;
@@ -1459,28 +1477,47 @@ export class PumpSwapSwap {
    * v11a: Read RPC call with backup fallback for sell-critical paths.
    * Tries primary first (via withAnalysisRetry), falls back to backup RPCs.
    */
+  // v11k: Parallel sell backup — fire primary + all backups simultaneously (first-success wins)
+  // Reduces worst-case from 24s (sequential) to 12s (parallel, single timeout window)
   private async withSellBackup<T>(
     fn: (conn: Connection) => Promise<T>,
-    timeoutMs: number = 8_000,
+    timeoutMs: number = 12_000,
   ): Promise<T> {
-    // Try primary first
-    try {
-      return await withAnalysisRetry(fn, this.connection, timeoutMs, true);
-    } catch (primaryErr) {
-      // v11a: Backup RPCs for sell redundancy
-      for (const backup of sellBackupConnections) {
-        try {
-          logger.warn('[pumpswap-sell] Primary RPC failed, trying backup...');
-          return await Promise.race([
-            fn(backup),
-            new Promise<never>((_, rej) => setTimeout(() => rej(new Error('backup timeout')), timeoutMs)),
-          ]);
-        } catch {
-          // Try next backup
+    const connections = [this.connection, ...sellBackupConnections];
+    return new Promise<T>((resolve, reject) => {
+      let resolved = false;
+      let completedCount = 0;
+      const errors: Error[] = [];
+
+      const timer = setTimeout(() => {
+        if (!resolved) {
+          resolved = true;
+          reject(new Error(`All ${connections.length} RPCs timed out after ${timeoutMs}ms`));
         }
+      }, timeoutMs);
+
+      for (let i = 0; i < connections.length; i++) {
+        const conn = connections[i];
+        fn(conn)
+          .then((result) => {
+            if (!resolved) {
+              resolved = true;
+              clearTimeout(timer);
+              if (i > 0) logger.info(`[pumpswap-sell] Backup RPC #${i} succeeded (primary was slower)`);
+              resolve(result);
+            }
+          })
+          .catch((err) => {
+            completedCount++;
+            errors.push(err instanceof Error ? err : new Error(String(err)));
+            if (completedCount === connections.length && !resolved) {
+              resolved = true;
+              clearTimeout(timer);
+              reject(errors[0]); // Throw primary error
+            }
+          });
       }
-      throw primaryErr; // All backups failed, rethrow original
-    }
+    });
   }
 
   private async sendMultiEndpoint(
@@ -1586,13 +1623,15 @@ export class PumpSwapSwap {
     logger.info(`[pumpswap] TX sent (first-success): ${signature}`);
     this.lastSentSignature = signature; // v10a: Save for recovery if confirmation times out
 
-    // v11g: 15s timeout with backup RPC rotation + rebroadcast every 2s during confirmation
+    // v11k: 25s timeout (was 15s). During Solana congestion, TXs land in 15-25s.
+    // 15s caused POST-SELL RECOVERY loops where TX landed but bot didn't see it.
+    // FtnW: TP1 sell took 51s total because 15s timeout → retry → eventually confirmed.
     const pollResult = await pollConfirmation(
-      signature, this.connection, 15_000, 1_000, sellBackupConnections,
+      signature, this.connection, 25_000, 1_000, sellBackupConnections,
       { rawTransaction },
     );
     if (!pollResult.confirmed) {
-      throw new Error(`TX confirmation error: ${pollResult.error ?? 'Polling timeout (15s)'}`);
+      throw new Error(`TX confirmation error: ${pollResult.error ?? 'Polling timeout (25s)'}`);
     }
 
     logger.info(`[pumpswap] TX confirmed: ${signature}`);

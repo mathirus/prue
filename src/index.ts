@@ -1,8 +1,8 @@
-// v11k: Configure undici connection pool BEFORE any other imports that use fetch.
-// Without this, Node.js opens unlimited TCP sockets per request, exhausting ephemeral ports
-// under concurrent load (20+ RPC calls during pool analysis). Default is unlimited.
-// Recommended by Triton One: https://docs.triton.one/chains/solana/web3js-socket-connection-issues
-import { setGlobalDispatcher, Agent } from 'undici';
+// v11k: On Node.js 18, globalThis.fetch uses an INTERNAL undici with unlimited connections.
+// setGlobalDispatcher only affects the npm undici package, NOT globalThis.fetch.
+// 22+ files use bare fetch() which resolves to globalThis.fetch → port exhaustion.
+// Fix: Override globalThis.fetch with npm undici's fetch (which respects setGlobalDispatcher).
+import { setGlobalDispatcher, Agent, fetch as undiciFetch } from 'undici';
 setGlobalDispatcher(new Agent({
   connections: 50,          // Max connections per host (default: unlimited → port exhaustion)
   pipelining: 1,            // No HTTP pipelining (1 request at a time per connection)
@@ -12,6 +12,8 @@ setGlobalDispatcher(new Agent({
   keepAliveTimeout: 4_000,  // Close idle connections after 4s
   keepAliveMaxTimeout: 30_000, // Force-recycle connections after 30s
 }));
+// Override globalThis.fetch so ALL bare fetch() calls in the codebase use the pooled dispatcher
+globalThis.fetch = undiciFetch as unknown as typeof globalThis.fetch;
 
 import { loadConfig, validateConfig } from './config.js';
 import { logger } from './utils/logger.js';
@@ -358,8 +360,25 @@ async function main(): Promise<void> {
         const tokenBalance = tokenAccounts.value?.[0]?.account?.data?.parsed?.info?.tokenAmount;
         const currentTokens = tokenBalance ? Number(tokenBalance.amount) : 0;
         if (currentTokens === 0) {
+          // v11k: Estimate SOL returned via balance delta
+          let estimatedOutputLamports = 0;
+          const preBal = getCachedBalanceSol();
+          if (preBal !== null && wallet) {
+            try {
+              const curLamports = await Promise.race([
+                rpcManager.connection.getBalance(wallet.publicKey),
+                new Promise<never>((_, rej) => setTimeout(() => rej(new Error('timeout')), 5_000)),
+              ]);
+              const delta = (curLamports / 1e9) - preBal;
+              if (delta > 0) {
+                estimatedOutputLamports = Math.floor(delta * 1e9);
+                logger.info(`[bot] PRE-SELL CHECK: Estimated output ${delta.toFixed(6)} SOL from balance delta`);
+              }
+              setCachedBalanceLamports(curLamports);
+            } catch { /* proceed with 0 */ }
+          }
           logger.info(`[bot] ✅ PRE-SELL CHECK: Token balance already 0 — position already sold, closing immediately`);
-          return { success: true, inputAmount: amount, outputAmount: 0, pricePerToken: 0, fee: 0, timestamp: Date.now() };
+          return { success: true, inputAmount: amount, outputAmount: estimatedOutputLamports, pricePerToken: 0, fee: 0, timestamp: Date.now() };
         }
         if (currentTokens < amount * 0.1) {
           logger.info(`[bot] ⚠️ PRE-SELL CHECK: Only ${currentTokens} tokens remaining (requested ${amount}), adjusting sell amount`);
@@ -485,6 +504,7 @@ async function main(): Promise<void> {
       }
 
       // v10a: Post-sell verification for emergency path too
+      // v11k: Estimate SOL returned via balance delta
       if (wallet) try {
         const tokenAccounts = await withAnalysisRetry(
           (conn) => conn.getParsedTokenAccountsByOwner(wallet!.publicKey, { mint: tokenMint }),
@@ -492,8 +512,24 @@ async function main(): Promise<void> {
         );
         const bal = tokenAccounts.value?.[0]?.account?.data?.parsed?.info?.tokenAmount;
         if (!bal || Number(bal.amount) === 0) {
-          logger.info(`[bot] ✅ POST-SELL RECOVERY (emergency): Token balance is 0 — sell landed!`);
-          return { success: true, inputAmount: amount, outputAmount: 0, pricePerToken: 0, fee: 0, timestamp: Date.now() };
+          let estOutput = 0;
+          const preBal = getCachedBalanceSol();
+          if (preBal !== null) {
+            try {
+              const curLam = await Promise.race([
+                rpcManager.connection.getBalance(wallet.publicKey),
+                new Promise<never>((_, rej) => setTimeout(() => rej(new Error('timeout')), 5_000)),
+              ]);
+              const delta = (curLam / 1e9) - preBal;
+              if (delta > 0) {
+                estOutput = Math.floor(delta * 1e9);
+                logger.info(`[bot] POST-SELL RECOVERY (emergency): Estimated output ${delta.toFixed(6)} SOL`);
+              }
+              setCachedBalanceLamports(curLam);
+            } catch { /* proceed with 0 */ }
+          }
+          logger.info(`[bot] ✅ POST-SELL RECOVERY (emergency): Token balance is 0 — sell landed! Output: ~${(estOutput / 1e9).toFixed(6)} SOL`);
+          return { success: true, inputAmount: amount, outputAmount: estOutput, pricePerToken: 0, fee: 0, timestamp: Date.now() };
         }
       } catch { /* continue to report failure */ }
 
@@ -691,16 +727,38 @@ async function main(): Promise<void> {
 
       if (remainingTokens === 0) {
         // Tokens are GONE — a sell TX actually landed despite polling timeout!
-        logger.info(`[bot] ✅ POST-SELL RECOVERY: Token balance is 0 — sell succeeded on-chain despite polling failures!`);
+        // v11k: Estimate SOL returned by checking balance delta (pre-sell cache vs current)
+        let estimatedOutputLamports = 0;
+        const preSellBalance = getCachedBalanceSol(); // Last known balance before sell priority paused updates
+        if (preSellBalance !== null && wallet) {
+          try {
+            const postBalLamports = await Promise.race([
+              rpcManager.connection.getBalance(wallet.publicKey),
+              new Promise<never>((_, rej) => setTimeout(() => rej(new Error('timeout')), 5_000)),
+            ]);
+            const postBal = postBalLamports / 1e9;
+            const delta = postBal - preSellBalance;
+            if (delta > 0) {
+              estimatedOutputLamports = Math.floor(delta * 1e9);
+              logger.info(`[bot] POST-SELL RECOVERY: Estimated output ${delta.toFixed(6)} SOL (balance: ${preSellBalance.toFixed(6)} → ${postBal.toFixed(6)})`);
+            } else {
+              logger.info(`[bot] POST-SELL RECOVERY: Balance delta ≤ 0 (${delta.toFixed(6)} SOL), using 0`);
+            }
+            // Update balance cache with fresh value
+            setCachedBalanceLamports(postBalLamports);
+          } catch {
+            logger.warn(`[bot] POST-SELL RECOVERY: Could not check balance, using 0`);
+          }
+        }
+        logger.info(`[bot] ✅ POST-SELL RECOVERY: Token balance is 0 — sell succeeded on-chain! Output: ~${(estimatedOutputLamports / 1e9).toFixed(6)} SOL`);
         return {
           success: true,
           inputAmount: amount,
-          outputAmount: 0, // Unknown, but position manager will handle via balance diff
+          outputAmount: estimatedOutputLamports,
           pricePerToken: 0,
           fee: 0,
           timestamp: Date.now(),
           txSignature: undefined,
-          // Mark as recovered so position manager knows output is approximate
           error: undefined,
         };
       } else if (remainingTokens < amount * 0.5) {

@@ -317,10 +317,11 @@ export class JupiterSwap {
     const signature = successfulSigs[0];
     logger.info(`[jupiter] TX sent to ${successfulSigs.length} endpoints: ${signature}`);
 
-    // v11a: Reduced timeout 20s→10s (Helius paid tier confirms faster)
-    const pollResult = await pollConfirmation(signature, this.connection, 10_000, 1_000);
+    // v11k: 25s timeout (was 10s). During Solana congestion, TXs land in 15-25s.
+    // 10s was too aggressive — caused false "sell failed" when TX actually landed.
+    const pollResult = await pollConfirmation(signature, this.connection, 25_000, 1_000);
     if (!pollResult.confirmed) {
-      throw new Error(`TX confirmation error: ${pollResult.error ?? 'Polling timeout (10s)'}`);
+      throw new Error(`TX confirmation error: ${pollResult.error ?? 'Polling timeout (25s)'}`);
     }
 
     logger.info(`[jupiter] TX confirmed: ${signature}`);
