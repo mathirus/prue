@@ -1,18 +1,17 @@
 import { Connection, type ConnectionConfig } from '@solana/web3.js';
-import { createRequire } from 'node:module';
-import AgentKeepAlive from 'agentkeepalive';
 import { logger } from '../utils/logger.js';
 import { RateLimiter } from '../utils/rate-limiter.js';
 
-// v11j: node-fetch v2 (CJS, transitive dep of @solana/web3.js) supports the `agent` option
-// that built-in globalThis.fetch silently ignores. Without this, our custom httpAgent has no effect.
-const _require = createRequire(import.meta.url);
-const nodeFetch: (url: string | URL, init?: Record<string, unknown>) => Promise<Response> = _require('node-fetch');
+// v11k: Replaced agentkeepalive + node-fetch with globalThis.fetch (undici).
+// Root cause: agentkeepalive creates socket storms (69 sockets for 6 requests)
+// during Helius blips, blocking the event loop and making the bot unable to sell.
+// curl works fine (188ms) while node-fetch+agent times out at 9-12s.
+// undici (built into Node.js 18+) manages its own connection pool robustly.
+// No custom socket management = no socket pool poisoning.
 
 interface RpcEndpoint {
   url: string;
   connection: Connection;
-  agent: InstanceType<typeof AgentKeepAlive.HttpsAgent>;
   healthy: boolean;
   latencyMs: number;
   failCount: number;
@@ -37,20 +36,17 @@ export class RpcManager {
   ) {
     this.rateLimiter = new RateLimiter(rateLimit, rateLimit);
 
-    // v11j: Base config saved for connection recreation. httpAgent and fetch are per-endpoint.
     this.baseConnConfig = {
       commitment: 'confirmed',
       confirmTransactionInitialTimeout: 30_000,
       wsEndpoint: this.wsUrl,
-      disableRetryOnRateLimit: true, // Prevent @solana/web3.js from auto-retrying 429s (causes cascade)
+      disableRetryOnRateLimit: true,
     };
 
     for (const url of urls) {
-      const agent = this.createAgent();
       this.endpoints.push({
         url,
-        connection: this.createConnection(url, agent),
-        agent,
+        connection: this.createConnection(url),
         healthy: true,
         latencyMs: 0,
         failCount: 0,
@@ -60,62 +56,41 @@ export class RpcManager {
     }
   }
 
-  // v11j: Layer 1 — Custom HTTP agent with aggressive timeouts
-  // DEFAULT agentkeepalive: timeout=38s, freeSocketTimeout=19s → death spiral on sustained outage
-  // OUR agent: timeout=10s (kills active sockets fast), socketActiveTTL=60s (force-recycle)
-  private createAgent(): InstanceType<typeof AgentKeepAlive.HttpsAgent> {
-    return new AgentKeepAlive.HttpsAgent({
-      keepAlive: true,
-      maxSockets: 25,
-      maxFreeSockets: 5,
-      freeSocketTimeout: 15_000,   // Kill idle sockets after 15s (default 19s)
-      timeout: 10_000,             // Kill ACTIVE sockets after 10s no response (default 38s!) — KEY FIX
-      socketActiveTTL: 60_000,     // Force-recycle sockets every 60s even if healthy
-    });
-  }
-
-  // v11j: Layer 3 — Custom fetch with AbortController timeout (8s absolute per request)
-  // Uses node-fetch instead of globalThis.fetch because built-in fetch ignores the `agent` option.
-  // This ensures Layer 1 (custom httpAgent) actually works.
-  private createFetchWithAgent(agent: InstanceType<typeof AgentKeepAlive.HttpsAgent>) {
-    const FETCH_TIMEOUT_MS = 8_000;
+  // v11k: Simple fetch wrapper with AbortController timeout.
+  // globalThis.fetch (undici) manages its own connection pool with proper keep-alive.
+  // No agentkeepalive = no socket storms = no event loop blocking.
+  private createFetchWithTimeout() {
+    const FETCH_TIMEOUT_MS = 9_000;
     return async (url: string | URL, init?: Record<string, unknown>): Promise<Response> => {
       const controller = new AbortController();
       const start = Date.now();
       const timer = setTimeout(() => {
         const elapsed = Date.now() - start;
-        const agentStatus = agent.getCurrentStatus();
-        logger.warn(
-          `[rpc] FETCH TIMEOUT (${elapsed}ms): ${String(url).substring(0, 60)}... | ` +
-          `sockets: create=${agentStatus.createSocketCount} active=${Object.keys(agentStatus.sockets).length} ` +
-          `free=${Object.keys(agentStatus.freeSockets).length} total=${agentStatus.requestCount} ` +
-          `timeout=${agentStatus.timeoutSocketCount}`,
-        );
+        logger.warn(`[rpc] FETCH TIMEOUT (${elapsed}ms): ${String(url).substring(0, 60)}...`);
         controller.abort();
       }, FETCH_TIMEOUT_MS);
       try {
-        return await nodeFetch(url, {
-          ...init,
-          agent,          // Layer 1: custom agent with aggressive socket timeouts
-          signal: controller.signal,  // Layer 3: 8s absolute timeout per request
+        const response = await globalThis.fetch(String(url), {
+          ...init as RequestInit,
+          signal: controller.signal,
         });
+        return response;
       } finally {
         clearTimeout(timer);
       }
     };
   }
 
-  // Create a Connection with our custom agent + fetch wrapper
-  private createConnection(url: string, agent: InstanceType<typeof AgentKeepAlive.HttpsAgent>): Connection {
+  // v11k: Connection with globalThis.fetch + timeout wrapper
+  private createConnection(url: string): Connection {
     return new Connection(url, {
       ...this.baseConnConfig,
-      httpAgent: false,  // v11j: Disable default agentkeepalive (we manage via custom fetch)
-      fetch: this.createFetchWithAgent(agent) as unknown as ConnectionConfig['fetch'],
+      httpAgent: false,
+      fetch: this.createFetchWithTimeout() as unknown as ConnectionConfig['fetch'],
     });
   }
 
   // v11j: Register callback for connection reset events
-  // Consumers can update their cached Connection references when reset happens
   onConnectionReset(callback: () => void): void {
     this.connectionResetCallbacks.push(callback);
   }
@@ -126,7 +101,6 @@ export class RpcManager {
       logger.warn('[rpc] No healthy endpoints, using first');
       return this.endpoints[0].connection;
     }
-    // Round-robin among healthy
     this.currentIndex = (this.currentIndex + 1) % healthy.length;
     return healthy[this.currentIndex].connection;
   }
@@ -150,7 +124,6 @@ export class RpcManager {
   startHealthChecks(intervalMs = 30_000): void {
     this.healthCheckInterval = setInterval(() => this.checkHealth(), intervalMs);
     this.checkHealth();
-    // v11g: Start cache warming alongside health checks
     this.startCacheWarming();
   }
 
@@ -161,11 +134,9 @@ export class RpcManager {
     this.stopCacheWarming();
   }
 
-  // v11g: Cache warming — keep TCP connections alive + Gatekeeper regional cache hot
-  // Helius docs recommend getHealth/getSlot every 1s for connection reuse (35ms → 0.5ms)
-  // Cost: 1 credit/s = 86,400 credits/day = 0.86% of 10M monthly budget
+  // v11g: Cache warming — keep connections alive + Gatekeeper regional cache hot
   private startCacheWarming(): void {
-    if (this.cacheWarmingInterval) return; // already running
+    if (this.cacheWarmingInterval) return;
     this.cacheWarmingInterval = setInterval(() => {
       this.endpoints[0].connection.getSlot('processed').catch(() => {});
     }, 1_000);
@@ -181,7 +152,6 @@ export class RpcManager {
   }
 
   private async checkHealth(): Promise<void> {
-    // v10a: Skip if previous check still running
     if (this.isChecking) {
       logger.debug('[rpc] Health check skipped (previous still running)');
       return;
@@ -192,8 +162,6 @@ export class RpcManager {
       for (const ep of this.endpoints) {
         const start = Date.now();
         try {
-          // v10a: 5s timeout on health check getSlot — prevents indefinite hangs
-          // Without this, getSlot on Helius during load can hang 30-60s
           await Promise.race([
             ep.connection.getSlot(),
             new Promise<never>((_, reject) =>
@@ -209,13 +177,9 @@ export class RpcManager {
           const hostname = new URL(ep.url).hostname;
           const elapsed = Date.now() - start;
           const errMsg = err instanceof Error ? err.message : String(err);
-          const agentStatus = ep.agent.getCurrentStatus();
           if (ep.failCount >= 2) {
             logger.error(
-              `[rpc] Endpoint fail: ${hostname} (${ep.failCount} consecutive, ${elapsed}ms) — ${errMsg} | ` +
-              `sockets: created=${agentStatus.createSocketCount} active=${Object.keys(agentStatus.sockets).length} ` +
-              `free=${Object.keys(agentStatus.freeSockets).length} total=${agentStatus.requestCount} ` +
-              `timeout=${agentStatus.timeoutSocketCount} close=${agentStatus.closeSocketCount}`,
+              `[rpc] Endpoint fail: ${hostname} (${ep.failCount} consecutive, ${elapsed}ms) — ${errMsg}`,
             );
           }
           if (ep.failCount >= 3) {
@@ -224,9 +188,7 @@ export class RpcManager {
         }
         ep.lastCheck = Date.now();
 
-        // v11j: Layer 2 — Connection reset at 3+ consecutive fails with 30s cooldown
-        // Lowered from 5 to 3: at 5 fails the agent socket pool is already saturated and
-        // all pending requests (pool parsing, blockhash, etc.) pile up. Reset ASAP.
+        // v11k: Connection reset at 3+ consecutive fails with 30s cooldown
         if (ep.failCount >= 3 && Date.now() - ep.lastConnectionReset >= 30_000) {
           this.resetEndpointConnection(ep);
         }
@@ -239,28 +201,17 @@ export class RpcManager {
     }
   }
 
-  // v11j: Layer 2 — Destroy old agent + connection, create fresh ones
+  // v11k: Simplified reset — just create fresh Connection (no agent to destroy)
   private resetEndpointConnection(ep: RpcEndpoint): void {
     const hostname = new URL(ep.url).hostname;
-    const agentStatus = ep.agent.getCurrentStatus();
     logger.warn(
-      `[rpc] CONNECTION RESET: ${hostname} — ${ep.failCount} consecutive fails | ` +
-      `sockets: created=${agentStatus.createSocketCount} active=${Object.keys(agentStatus.sockets).length} ` +
-      `free=${Object.keys(agentStatus.freeSockets).length} total=${agentStatus.requestCount} ` +
-      `timeout=${agentStatus.timeoutSocketCount} close=${agentStatus.closeSocketCount} | ` +
-      `destroying agent, creating fresh Connection`,
+      `[rpc] CONNECTION RESET: ${hostname} — ${ep.failCount} consecutive fails | creating fresh Connection`,
     );
 
-    // Destroy old agent — closes ALL sockets immediately (no waiting for GC)
-    try { ep.agent.destroy(); } catch { /* ignore */ }
-
-    // Create new agent + connection
-    const newAgent = this.createAgent();
-    ep.agent = newAgent;
-    ep.connection = this.createConnection(ep.url, newAgent);
+    ep.connection = this.createConnection(ep.url);
     ep.lastConnectionReset = Date.now();
     ep.failCount = 0;
-    ep.healthy = false; // Start pessimistic, next health check will verify
+    ep.healthy = true; // v11k: Start optimistic — undici connections are fresh and reliable
 
     // Notify consumers to update cached references
     for (const cb of this.connectionResetCallbacks) {

@@ -1,3 +1,18 @@
+// v11k: Configure undici connection pool BEFORE any other imports that use fetch.
+// Without this, Node.js opens unlimited TCP sockets per request, exhausting ephemeral ports
+// under concurrent load (20+ RPC calls during pool analysis). Default is unlimited.
+// Recommended by Triton One: https://docs.triton.one/chains/solana/web3js-socket-connection-issues
+import { setGlobalDispatcher, Agent } from 'undici';
+setGlobalDispatcher(new Agent({
+  connections: 50,          // Max connections per host (default: unlimited → port exhaustion)
+  pipelining: 1,            // No HTTP pipelining (1 request at a time per connection)
+  connectTimeout: 10_000,   // 10s to establish TCP connection
+  bodyTimeout: 15_000,      // 15s to receive response body
+  headersTimeout: 10_000,   // 10s to receive response headers
+  keepAliveTimeout: 4_000,  // Close idle connections after 4s
+  keepAliveMaxTimeout: 30_000, // Force-recycle connections after 30s
+}));
+
 import { loadConfig, validateConfig } from './config.js';
 import { logger } from './utils/logger.js';
 import { RpcManager } from './core/rpc-manager.js';
