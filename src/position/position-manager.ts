@@ -819,8 +819,8 @@ export class PositionManager {
           this.priceMonitor.removeToken(position.tokenMint);
           this.liqMonitor?.unsubscribe(position.poolAddress);
           this.tradeLogger.savePosition(position);
-          this.positions.delete(position.tokenMint.toBase58());
-          this.sellingPositions.delete(position.tokenMint.toBase58());
+          this.positions.delete(position.id);
+          this.sellingPositions.delete(position.id);
           return;
         }
       }

@@ -1741,7 +1741,7 @@ async function main(): Promise<void> {
             }
             // Close position regardless
             if (position) {
-              await positionManager.forceClosePosition(tokenKey, 'honeypot_detected');
+              await positionManager.forceClosePosition(position.id, 'honeypot_detected');
             }
             tradeLogger.updateRejectionReasons(pool.id, 'honeypot_post_buy');
             // Don't emit tradeExecuted — position is already closed
