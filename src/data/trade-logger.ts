@@ -1,12 +1,13 @@
 import { getDb } from './database.js';
 import { logger } from '../utils/logger.js';
-import type { DetectedPool, SecurityResult, TradeResult, Position } from '../types.js';
+import type { DetectedPool, SecurityResult, TradeResult, Position, ScoringBreakdown } from '../types.js';
 import { BOT_VERSION } from '../constants.js';
 
 export class TradeLogger {
   logDetection(pool: DetectedPool, security?: SecurityResult): void {
     try {
       const db = getDb();
+      const bd = security?.breakdown;
       // v11h: Use UPSERT instead of INSERT OR REPLACE to preserve observation/wash/creator data
       // INSERT OR REPLACE deletes the entire row and re-inserts, wiping columns not in the INSERT.
       // ON CONFLICT DO UPDATE only modifies specified columns, keeping observation_initial_sol etc.
@@ -18,8 +19,14 @@ export class TradeLogger {
          dp_mint_auth_revoked, dp_freeze_auth_revoked, dp_rugcheck_score, dp_lp_burned,
          dp_graduation_time_s, dp_bundle_penalty, dp_insiders_count,
          dp_early_tx_count, dp_tx_velocity, dp_unique_slots,
-         dp_insider_wallets, dp_hidden_whale_count, bot_version)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         dp_insider_wallets, dp_hidden_whale_count, bot_version,
+         dp_hhi_value, dp_hhi_penalty, dp_concentrated_value, dp_concentrated_penalty,
+         dp_holder_penalty, dp_graduation_bonus, dp_obs_bonus, dp_organic_bonus,
+         dp_smart_wallet_bonus, dp_creator_age_penalty, dp_rugcheck_penalty,
+         dp_velocity_penalty, dp_insider_penalty, dp_whale_penalty, dp_timing_cv_penalty,
+         dp_fast_score, dp_deferred_delta, dp_final_score)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(id) DO UPDATE SET
          security_score = excluded.security_score,
          security_passed = excluded.security_passed,
@@ -39,7 +46,25 @@ export class TradeLogger {
          dp_unique_slots = excluded.dp_unique_slots,
          dp_insider_wallets = excluded.dp_insider_wallets,
          dp_hidden_whale_count = excluded.dp_hidden_whale_count,
-         bot_version = excluded.bot_version
+         bot_version = excluded.bot_version,
+         dp_hhi_value = excluded.dp_hhi_value,
+         dp_hhi_penalty = excluded.dp_hhi_penalty,
+         dp_concentrated_value = excluded.dp_concentrated_value,
+         dp_concentrated_penalty = excluded.dp_concentrated_penalty,
+         dp_holder_penalty = excluded.dp_holder_penalty,
+         dp_graduation_bonus = excluded.dp_graduation_bonus,
+         dp_obs_bonus = excluded.dp_obs_bonus,
+         dp_organic_bonus = excluded.dp_organic_bonus,
+         dp_smart_wallet_bonus = excluded.dp_smart_wallet_bonus,
+         dp_creator_age_penalty = excluded.dp_creator_age_penalty,
+         dp_rugcheck_penalty = excluded.dp_rugcheck_penalty,
+         dp_velocity_penalty = excluded.dp_velocity_penalty,
+         dp_insider_penalty = excluded.dp_insider_penalty,
+         dp_whale_penalty = excluded.dp_whale_penalty,
+         dp_timing_cv_penalty = excluded.dp_timing_cv_penalty,
+         dp_fast_score = excluded.dp_fast_score,
+         dp_deferred_delta = excluded.dp_deferred_delta,
+         dp_final_score = excluded.dp_final_score
       `).run(
         pool.id,
         pool.source,
@@ -71,6 +96,25 @@ export class TradeLogger {
         security?.checks.insiderWallets?.join(',') ?? null,
         security?.checks.hiddenWhaleCount ?? null,
         BOT_VERSION,
+        // v11o: Breakdown columns
+        bd?.hhiValue ?? null,
+        bd?.hhiPenalty ?? null,
+        bd?.concentratedValue ?? null,
+        bd?.concentratedPenalty ?? null,
+        bd?.holderPenalty ?? null,
+        bd?.graduationBonus ?? null,
+        bd?.obsBonus ?? null,
+        bd?.organicBonus ?? null,
+        bd?.smartWalletBonus ?? null,
+        bd?.creatorAgePenalty ?? null,
+        bd?.rugcheckPenalty ?? null,
+        bd?.velocityPenalty ?? null,
+        bd?.insiderPenalty ?? null,
+        bd?.whalePenalty ?? null,
+        bd?.timingCvPenalty ?? null,
+        bd?.fastScore ?? null,
+        bd?.deferredDelta ?? null,
+        bd?.finalScore ?? null,
       );
     } catch (err) {
       logger.error('[trade-logger] Failed to log detection', { error: String(err) });
@@ -274,6 +318,72 @@ export class TradeLogger {
       );
     } catch (err) {
       logger.error('[trade-logger] Failed to log token analysis', { error: String(err) });
+    }
+  }
+
+  /**
+   * v11o: Update breakdown bonuses applied in index.ts (obs, organic, smart wallet, creator age) + final score.
+   */
+  updateBreakdownBonuses(poolId: string, updates: {
+    obsBonus?: number;
+    organicBonus?: number;
+    smartWalletBonus?: number;
+    creatorAgePenalty?: number;
+    finalScore?: number;
+  }): void {
+    try {
+      const db = getDb();
+      db.prepare(`
+        UPDATE detected_pools SET
+          dp_obs_bonus = COALESCE(?, dp_obs_bonus),
+          dp_organic_bonus = COALESCE(?, dp_organic_bonus),
+          dp_smart_wallet_bonus = COALESCE(?, dp_smart_wallet_bonus),
+          dp_creator_age_penalty = COALESCE(?, dp_creator_age_penalty),
+          dp_final_score = COALESCE(?, dp_final_score)
+        WHERE id = ?
+      `).run(
+        updates.obsBonus ?? null,
+        updates.organicBonus ?? null,
+        updates.smartWalletBonus ?? null,
+        updates.creatorAgePenalty ?? null,
+        updates.finalScore ?? null,
+        poolId,
+      );
+    } catch (err) {
+      logger.debug(`[trade-logger] Failed to update breakdown bonuses: ${err}`);
+    }
+  }
+
+  /**
+   * v11o: Update HHI tracking data on positions (post-buy 60s check).
+   */
+  updatePositionHHI(positionId: string, data: {
+    hhiEntry?: number;
+    hhi60s?: number;
+    holderCount60s?: number;
+    concentratedEntry?: number;
+    concentrated60s?: number;
+  }): void {
+    try {
+      const db = getDb();
+      db.prepare(`
+        UPDATE positions SET
+          hhi_entry = COALESCE(?, hhi_entry),
+          hhi_60s = COALESCE(?, hhi_60s),
+          holder_count_60s = COALESCE(?, holder_count_60s),
+          concentrated_entry = COALESCE(?, concentrated_entry),
+          concentrated_60s = COALESCE(?, concentrated_60s)
+        WHERE id = ?
+      `).run(
+        data.hhiEntry ?? null,
+        data.hhi60s ?? null,
+        data.holderCount60s ?? null,
+        data.concentratedEntry ?? null,
+        data.concentrated60s ?? null,
+        positionId,
+      );
+    } catch (err) {
+      logger.debug(`[trade-logger] Failed to update position HHI: ${err}`);
     }
   }
 

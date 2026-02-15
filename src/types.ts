@@ -142,12 +142,36 @@ export interface DetectedPool {
 
 // ─── Security Analysis ───────────────────────────────────────────────
 
+// v11o: Scoring breakdown for backtesting — each penalty/bonus tracked individually
+export interface ScoringBreakdown {
+  fastScore: number;
+  deferredDelta: number;
+  finalScore: number;
+  // Individual components
+  hhiValue: number;
+  hhiPenalty: number;
+  concentratedValue: number;
+  concentratedPenalty: number;
+  holderPenalty: number;
+  graduationBonus: number;
+  obsBonus: number;
+  organicBonus: number;
+  smartWalletBonus: number;
+  creatorAgePenalty: number;
+  rugcheckPenalty: number;
+  velocityPenalty: number;
+  insiderPenalty: number;
+  whalePenalty: number;
+  timingCvPenalty: number;
+}
+
 export interface SecurityResult {
   mint: PublicKey;
   score: number;
   passed: boolean;
   checks: SecurityChecks;
   timestamp: number;
+  breakdown?: ScoringBreakdown; // v11o: detailed scoring breakdown for DB persistence
 }
 
 export interface SecurityChecks {

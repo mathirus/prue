@@ -1617,6 +1617,22 @@ async function main(): Promise<void> {
         logger.info(`[bot] Creator penalty (deferred): ${deferredCreatorPenalty} → score ${oldScore}→${security.score}`);
       }
 
+      // v11o: Update breakdown with bonuses applied in index.ts and persist to DB
+      if (security.breakdown) {
+        security.breakdown.obsBonus = totalObservationBonus;
+        security.breakdown.organicBonus = organicResult?.bonus ?? 0;
+        security.breakdown.smartWalletBonus = smartWalletResult?.bonus ?? 0;
+        security.breakdown.creatorAgePenalty = deferredCreatorPenalty;
+        security.breakdown.finalScore = security.score;
+      }
+      tradeLogger.updateBreakdownBonuses(pool.id, {
+        obsBonus: totalObservationBonus,
+        organicBonus: organicResult?.bonus ?? 0,
+        smartWalletBonus: smartWalletResult?.bonus ?? 0,
+        creatorAgePenalty: deferredCreatorPenalty,
+        finalScore: security.score,
+      });
+
       // ═══════ FINAL DEFERRED CHECK — deferred may have lowered score below threshold ═══════
       if (!security.passed) {
         logger.warn(`[bot] ❌ DEFERRED REJECT: score ${security.score}/100 < ${config.analysis.minScore} after slow checks`);
@@ -1840,6 +1856,14 @@ async function main(): Promise<void> {
         if (position) {
           position.entryLatencyMs = entryLatencyMs;
           tradeLogger.savePosition(position); // Re-save with entry latency included
+
+          // v11o: Save entry HHI/concentrated data from scoring breakdown for post-buy tracking
+          if (security.breakdown) {
+            tradeLogger.updatePositionHHI(position.id, {
+              hhiEntry: security.breakdown.hhiValue,
+              concentratedEntry: security.breakdown.concentratedValue,
+            });
+          }
         }
         // v11f: Signal at-capacity to pause pool parsing (saves RPC bandwidth for sells)
         if (positionManager.activeTradeCount >= config.risk.maxConcurrent) {
@@ -1964,6 +1988,13 @@ async function main(): Promise<void> {
               if (position) {
                 position.entryLatencyMs = entryLatencyMs;
                 tradeLogger.savePosition(position);
+                // v11o: Save entry HHI for post-buy tracking
+                if (security.breakdown) {
+                  tradeLogger.updatePositionHHI(position.id, {
+                    hhiEntry: security.breakdown.hhiValue,
+                    concentratedEntry: security.breakdown.concentratedValue,
+                  });
+                }
               }
               // v11f: Signal at-capacity to pause pool parsing
               if (positionManager.activeTradeCount >= config.risk.maxConcurrent) {

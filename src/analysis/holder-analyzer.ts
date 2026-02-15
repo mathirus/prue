@@ -26,7 +26,7 @@ export interface HolderAnalysis {
  * Range: 0 (perfectly distributed) to 1 (single holder has everything)
  * Thresholds: >0.25 = highly concentrated, >0.5 = extreme concentration
  */
-function computeNonPoolHHI(holders: Array<{ pct: number }>): number {
+export function computeNonPoolHHI(holders: Array<{ pct: number }>): number {
   if (holders.length <= 1) return 0; // Only pool vault or empty
   const nonPool = holders.slice(1); // Skip pool vault (holders[0])
   const totalNonPoolPct = nonPool.reduce((sum, h) => sum + h.pct, 0);

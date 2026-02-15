@@ -254,6 +254,31 @@ function initSchema(database: Database.Database): void {
     `ALTER TABLE positions ADD COLUMN max_sell_burst INTEGER DEFAULT 0`,
     // v8u: ML data tracking — sell count per price snapshot for time-series analysis
     `ALTER TABLE position_price_log ADD COLUMN sell_count INTEGER DEFAULT 0`,
+    // v11o: Scoring breakdown — individual penalty/bonus tracking for backtesting
+    `ALTER TABLE detected_pools ADD COLUMN dp_hhi_value REAL`,
+    `ALTER TABLE detected_pools ADD COLUMN dp_hhi_penalty INTEGER`,
+    `ALTER TABLE detected_pools ADD COLUMN dp_concentrated_value REAL`,
+    `ALTER TABLE detected_pools ADD COLUMN dp_concentrated_penalty INTEGER`,
+    `ALTER TABLE detected_pools ADD COLUMN dp_holder_penalty INTEGER`,
+    `ALTER TABLE detected_pools ADD COLUMN dp_graduation_bonus INTEGER`,
+    `ALTER TABLE detected_pools ADD COLUMN dp_obs_bonus INTEGER`,
+    `ALTER TABLE detected_pools ADD COLUMN dp_organic_bonus INTEGER`,
+    `ALTER TABLE detected_pools ADD COLUMN dp_smart_wallet_bonus INTEGER`,
+    `ALTER TABLE detected_pools ADD COLUMN dp_creator_age_penalty INTEGER`,
+    `ALTER TABLE detected_pools ADD COLUMN dp_rugcheck_penalty INTEGER`,
+    `ALTER TABLE detected_pools ADD COLUMN dp_velocity_penalty INTEGER`,
+    `ALTER TABLE detected_pools ADD COLUMN dp_insider_penalty INTEGER`,
+    `ALTER TABLE detected_pools ADD COLUMN dp_whale_penalty INTEGER`,
+    `ALTER TABLE detected_pools ADD COLUMN dp_timing_cv_penalty INTEGER`,
+    `ALTER TABLE detected_pools ADD COLUMN dp_fast_score INTEGER`,
+    `ALTER TABLE detected_pools ADD COLUMN dp_deferred_delta INTEGER`,
+    `ALTER TABLE detected_pools ADD COLUMN dp_final_score INTEGER`,
+    // v11o: Post-buy HHI tracking — validate if HHI delta predicts outcomes
+    `ALTER TABLE positions ADD COLUMN hhi_entry REAL`,
+    `ALTER TABLE positions ADD COLUMN hhi_60s REAL`,
+    `ALTER TABLE positions ADD COLUMN holder_count_60s INTEGER`,
+    `ALTER TABLE positions ADD COLUMN concentrated_entry REAL`,
+    `ALTER TABLE positions ADD COLUMN concentrated_60s REAL`,
   ];
   for (const sql of migrations) {
     try { database.exec(sql); } catch { /* column already exists */ }

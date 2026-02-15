@@ -328,25 +328,21 @@ export class TokenScorer {
     }
 
     // Combined non-pool holder concentration penalty (PumpSwap only)
-    // v10f: Graduated penalty — old flat -5 let 44% concentration tokens pass with obs bonuses
-    // BUT: fresh winners also have high concentration (early snipers), so penalties must be moderate
-    // Data: HcF231Sa (winner) had 44.6% non-pool concentration — aggressive penalties block winners too
-    // Pool vault (holders[0]) dominates at ~80-97%, so we check holders[1]-[5]
+    // v11o: Reduced — hits 100% of fresh pools, doesn't discriminate (was -5 to -20, now -1 to -5)
     let combinedNonPoolPct = 0;
     if (isPumpSwap && hold.holders.length > 2) {
       const nonPoolHolders = hold.holders.slice(1, 6);
       combinedNonPoolPct = nonPoolHolders.reduce((sum, h) => sum + h.pct, 0);
       if (combinedNonPoolPct > 10) {
-        // v10f: Graduated penalty — conservative to avoid blocking winners
         let concPenalty: number;
         if (combinedNonPoolPct > 40) {
-          concPenalty = 20; // Extreme concentration
+          concPenalty = 5;
         } else if (combinedNonPoolPct > 30) {
-          concPenalty = 15; // High concentration
+          concPenalty = 4;
         } else if (combinedNonPoolPct > 20) {
-          concPenalty = 10; // Moderate concentration
+          concPenalty = 3;
         } else {
-          concPenalty = 5;  // Low concentration (unchanged)
+          concPenalty = 1;
         }
         score -= concPenalty;
         logger.warn(`[scorer] ⚠️ Concentrated non-pool holders: top5=${combinedNonPoolPct.toFixed(1)}% → -${concPenalty} (threshold: 10%)`);
@@ -367,38 +363,26 @@ export class TokenScorer {
     }
 
     // Low holder count penalty (PumpSwap only) - LIQUIDITY-WEIGHTED
-    // v8o UPDATE: Historical data shows h=1-2 is BEST bracket (63% win, N=19, avg_liq=$57K)
-    //   h=1-2: 63% win, 37% rug, avg_pnl=-0.000482 (BEST)
-    //   h=6-10: 63% win, 50% rug, avg_pnl=-0.000255
-    //   h=11-20: 50% win, 67% rug (WORST!)
-    // For $30K+ liq: few holders means only pool vault holds tokens = LESS dump risk
-    // v8o: No penalty for high-liq ($30K+) PumpSwap regardless of holder count
-    //       Keep penalty for low-liq tokens where few holders = concentrated risk
+    // v11o: Reduced — fresh pools always have few holders, doesn't discriminate (was -25/-15/-5, now -8/-5/-2)
     if (isPumpSwap && hold.holderCount === -1) {
       score -= 10;
       logger.warn(`[scorer] ⚠️ Holder count unknown (DAS failed): penalty -10`);
     } else if (isPumpSwap && hold.holderCount > 0) {
       const highLiquidity = liq.liquidityUsd >= 30_000;
       if (highLiquidity) {
-        // $30K+ liq: no holder count penalty (data: h=1-2 is best bracket)
         if (hold.holderCount < 10) {
           logger.info(`[scorer] ✓ Few holders (${hold.holderCount}) but high liq ($${Math.round(liq.liquidityUsd)}) → no penalty`);
         }
       } else if (hold.holderCount <= 1) {
-        // v9x: Single holder (deployer only) = nobody has bought yet, pure coin flip
-        // Data: 4 trades at holders=1 → 2 WIN, 2 RUG (50/50), but rugs are -100%
-        score -= 25;
-        logger.warn(`[scorer] ⚠️ SOLO HOLDER: ${hold.holderCount} (penalty: -25, liq: $${Math.round(liq.liquidityUsd)})`);
+        score -= 8;
+        logger.warn(`[scorer] ⚠️ SOLO HOLDER: ${hold.holderCount} (penalty: -8, liq: $${Math.round(liq.liquidityUsd)})`);
       } else if (hold.holderCount < 5) {
-        // v8t: 2-4 holders = very concentrated, high dump risk
-        score -= 15;
-        logger.warn(`[scorer] ⚠️ Very few holders: ${hold.holderCount} (penalty: -15, liq: $${Math.round(liq.liquidityUsd)})`);
-      } else if (hold.holderCount < 10) {
-        // v8t: 5-9 holders = somewhat risky, reduced from -15 to -5
         score -= 5;
-        logger.warn(`[scorer] ⚠️ Low holder count: ${hold.holderCount} (penalty: -5, liq: $${Math.round(liq.liquidityUsd)})`);
+        logger.warn(`[scorer] ⚠️ Very few holders: ${hold.holderCount} (penalty: -5, liq: $${Math.round(liq.liquidityUsd)})`);
+      } else if (hold.holderCount < 10) {
+        score -= 2;
+        logger.warn(`[scorer] ⚠️ Low holder count: ${hold.holderCount} (penalty: -2, liq: $${Math.round(liq.liquidityUsd)})`);
       }
-      // v8t: removed -5 for 10-14 holders (unvalidated, blocks most fresh pools)
     }
 
     // LP burned (+10 for non-PumpSwap only)
@@ -515,14 +499,14 @@ export class TokenScorer {
       // Note: cross-reference with coinCreator happens in index.ts where creator is available
     }
 
-    // v11n: HHI penalty — high concentration among non-pool holders
+    // v11o: HHI penalty — REDUCED from -10/-5 to -3/-1 (hits 100% of fresh pools)
     if (isPumpSwap && hold.holderHHI > 0) {
       if (hold.holderHHI > 0.5) {
-        score -= 10;
-        logger.warn(`[scorer] ⚠️ HHI extreme: ${hold.holderHHI.toFixed(2)} (>0.5) → -10`);
+        score -= 3;
+        logger.warn(`[scorer] ⚠️ HHI extreme: ${hold.holderHHI.toFixed(2)} (>0.5) → -3`);
       } else if (hold.holderHHI > 0.25) {
-        score -= 5;
-        logger.warn(`[scorer] ⚠️ HHI high: ${hold.holderHHI.toFixed(2)} (>0.25) → -5`);
+        score -= 1;
+        logger.warn(`[scorer] ⚠️ HHI high: ${hold.holderHHI.toFixed(2)} (>0.25) → -1`);
       }
     }
 
@@ -790,42 +774,46 @@ export class TokenScorer {
     }
 
     // Combined non-pool holder penalty
-    // v10f: Graduated penalty (matches full analysis)
+    // v11o: Reduced — hits 100% of fresh pools, doesn't discriminate (was -5 to -20, now -1 to -5)
     let combinedNonPoolPct = 0;
+    let concentratedPenalty = 0;
     if (isPumpSwap && hold.holders.length > 2) {
       const nonPoolHolders = hold.holders.slice(1, 6);
       combinedNonPoolPct = nonPoolHolders.reduce((sum, h) => sum + h.pct, 0);
       if (combinedNonPoolPct > 10) {
-        let concPenalty: number;
         if (combinedNonPoolPct > 40) {
-          concPenalty = 20;
+          concentratedPenalty = 5;
         } else if (combinedNonPoolPct > 30) {
-          concPenalty = 15;
+          concentratedPenalty = 4;
         } else if (combinedNonPoolPct > 20) {
-          concPenalty = 10;
+          concentratedPenalty = 3;
         } else {
-          concPenalty = 5;
+          concentratedPenalty = 1;
         }
-        delta -= concPenalty;
-        logger.warn(`[scorer-deferred] Concentrated non-pool holders: top5=${combinedNonPoolPct.toFixed(1)}% → -${concPenalty}`);
+        delta -= concentratedPenalty;
+        logger.warn(`[scorer-deferred] Concentrated non-pool holders: top5=${combinedNonPoolPct.toFixed(1)}% → -${concentratedPenalty}`);
       }
     }
 
     // v10d: Hidden whale detection — -15 per whale
+    let whalePenalty = 0;
     if (isPumpSwap && hold.holders.length > 5) {
       const nonPoolHiddenWhales = hold.holders.slice(5, 20).filter(h => h.pct > 3);
       if (nonPoolHiddenWhales.length > 0) {
         const whaleCount = nonPoolHiddenWhales.length;
-        const penalty = whaleCount * -15;
-        delta += penalty;
-        logger.warn(`[scorer-deferred] Hidden whales: ${whaleCount} holders >3% (penalty: ${penalty})`);
+        whalePenalty = whaleCount * 15;
+        delta -= whalePenalty;
+        logger.warn(`[scorer-deferred] Hidden whales: ${whaleCount} holders >3% (penalty: -${whalePenalty})`);
       }
     }
 
     // Low holder count penalty
+    // v11o: Reduced — fresh pools always have few holders, doesn't discriminate (was -25/-15/-5, now -8/-5/-2)
+    let holderPenalty = 0;
     const liqUsd = fastResult.checks.liquidityUsd;
     if (isPumpSwap && hold.holderCount === -1) {
-      delta -= 10;
+      holderPenalty = 10;
+      delta -= holderPenalty;
       logger.warn(`[scorer-deferred] Holder count unknown (DAS failed): -10`);
     } else if (isPumpSwap && hold.holderCount > 0) {
       const highLiquidity = liqUsd >= 30_000;
@@ -834,14 +822,17 @@ export class TokenScorer {
           logger.info(`[scorer-deferred] Few holders (${hold.holderCount}) but high liq → no penalty`);
         }
       } else if (hold.holderCount <= 1) {
-        delta -= 25;
-        logger.warn(`[scorer-deferred] SOLO HOLDER: ${hold.holderCount} (-25, liq: $${Math.round(liqUsd)})`);
+        holderPenalty = 8;
+        delta -= holderPenalty;
+        logger.warn(`[scorer-deferred] SOLO HOLDER: ${hold.holderCount} (-${holderPenalty}, liq: $${Math.round(liqUsd)})`);
       } else if (hold.holderCount < 5) {
-        delta -= 15;
-        logger.warn(`[scorer-deferred] Very few holders: ${hold.holderCount} (-15)`);
+        holderPenalty = 5;
+        delta -= holderPenalty;
+        logger.warn(`[scorer-deferred] Very few holders: ${hold.holderCount} (-${holderPenalty})`);
       } else if (hold.holderCount < 10) {
-        delta -= 5;
-        logger.warn(`[scorer-deferred] Low holders: ${hold.holderCount} (-5)`);
+        holderPenalty = 2;
+        delta -= holderPenalty;
+        logger.warn(`[scorer-deferred] Low holders: ${hold.holderCount} (-${holderPenalty})`);
       }
     }
 
@@ -852,11 +843,13 @@ export class TokenScorer {
     }
 
     // RugCheck (v11b: timeout penalty)
+    let rugcheckPenalty = 0;
     if (!rc) {
-      delta -= 3;
+      rugcheckPenalty = 3;
+      delta -= rugcheckPenalty;
       logger.warn(`[scorer-deferred] RugCheck timeout → -3`);
     } else if (rc) {
-      if (rc.score > 70) delta += 5;
+      if (rc.score > 70) { delta += 5; rugcheckPenalty -= 5; } // bonus = negative penalty
       const dangerRisks = rc.risks.filter(r => r.startsWith('danger:'));
       const PUMPSWAP_FALSE_POSITIVE_DANGERS = [
         'LP Unlocked', 'Single holder ownership', 'High ownership',
@@ -867,17 +860,22 @@ export class TokenScorer {
         ? dangerRisks.filter(r => !PUMPSWAP_FALSE_POSITIVE_DANGERS.some(fp => r.includes(fp)))
         : dangerRisks;
       if (relevantDangers.length > 0) {
-        delta -= Math.min(15, relevantDangers.length * 5);
+        const dangerPen = Math.min(15, relevantDangers.length * 5);
+        rugcheckPenalty += dangerPen;
+        delta -= dangerPen;
         logger.warn(`[scorer-deferred] RugCheck dangers: ${relevantDangers.join(', ')}`);
       }
       if (rc.rugged) {
+        rugcheckPenalty += 100;
         delta -= 100;
         logger.warn(`[scorer-deferred] RugCheck: RUGGED`);
       }
       if (rc.insidersDetected >= 3) {
+        rugcheckPenalty += 100;
         delta -= 100;
         logger.warn(`[scorer-deferred] RugCheck: ${rc.insidersDetected} insiders → BLOCKED`);
       } else if (rc.insidersDetected > 0) {
+        rugcheckPenalty += 20;
         delta -= 20;
         logger.warn(`[scorer-deferred] RugCheck: ${rc.insidersDetected} insiders → -20`);
       }
@@ -895,46 +893,59 @@ export class TokenScorer {
     }
 
     // Graduation timing (v11c: REVERSED — fast=safe, negGrad=dangerous)
+    let graduationBonus = 0;
     if (bundle.graduationTimeSeconds < 0) {
+      graduationBonus = -15;
       delta -= 15;
       logger.warn(`[scorer-deferred] No graduation data → -15`);
     } else if (bundle.graduationTimeSeconds < 60) {
+      graduationBonus = 3;
       delta += 3;
       logger.info(`[scorer-deferred] Fast graduation ${bundle.graduationTimeSeconds}s → +3`);
     } else if (bundle.graduationTimeSeconds < 300) {
+      graduationBonus = 3;
       delta += 3;
       logger.info(`[scorer-deferred] Normal graduation → +3`);
     }
 
     // v10d: TX Velocity penalty — -20 for >=50 tx/min
+    let velocityPenalty = 0;
     if (bundle.txVelocity >= 50) {
+      velocityPenalty = 20;
       delta -= 20;
       logger.warn(`[scorer-deferred] TX velocity ${bundle.txVelocity} tx/min (≥50) → -20`);
     }
 
     // Insider graph wallets
     let insiderWalletCount = 0;
+    let insiderPenalty = 0;
     if (insiderGraph && insiderGraph.insiderWallets.length > 0) {
       insiderWalletCount = insiderGraph.insiderWallets.length;
       if (insiderWalletCount >= 5) {
+        insiderPenalty = 15;
         delta -= 15;
         logger.warn(`[scorer-deferred] Insider graph: ${insiderWalletCount} wallets → -15`);
       }
     }
 
-    // v11n: HHI penalty — high concentration among non-pool holders
+    // v11o: HHI penalty — REDUCED from -10/-5 to -3/-1 (hits 100% of fresh pools)
+    let hhiPenalty = 0;
     if (isPumpSwap && hold.holderHHI > 0) {
       if (hold.holderHHI > 0.5) {
-        delta -= 10;
-        logger.warn(`[scorer-deferred] HHI extreme: ${hold.holderHHI.toFixed(2)} (>0.5) → -10`);
+        hhiPenalty = 3;
+        delta -= 3;
+        logger.warn(`[scorer-deferred] HHI extreme: ${hold.holderHHI.toFixed(2)} (>0.5) → -3`);
       } else if (hold.holderHHI > 0.25) {
-        delta -= 5;
-        logger.warn(`[scorer-deferred] HHI high: ${hold.holderHHI.toFixed(2)} (>0.25) → -5`);
+        hhiPenalty = 1;
+        delta -= 1;
+        logger.warn(`[scorer-deferred] HHI high: ${hold.holderHHI.toFixed(2)} (>0.25) → -1`);
       }
     }
 
     // v11n: Timing cluster CV penalty — evenly-spaced TXs = bot coordinated
+    let timingCvPenalty = 0;
     if (bundle.timingClusterCV >= 0 && bundle.timingClusterCV < 0.3 && bundle.txCount >= 5) {
+      timingCvPenalty = 5;
       delta -= 5;
       logger.warn(`[scorer-deferred] Timing CV low: ${bundle.timingClusterCV.toFixed(2)} (<0.3, bot-like) → -5`);
     }
@@ -977,6 +988,27 @@ export class TokenScorer {
       passed: newScore >= this.config.analysis.minScore,
       checks,
       timestamp: Date.now(),
+      // v11o: Scoring breakdown for DB persistence and backtesting
+      breakdown: {
+        fastScore: fastResult.score,
+        deferredDelta: delta,
+        finalScore: newScore,
+        hhiValue: hold.holderHHI,
+        hhiPenalty: -hhiPenalty,
+        concentratedValue: combinedNonPoolPct,
+        concentratedPenalty: -concentratedPenalty,
+        holderPenalty: -holderPenalty,
+        graduationBonus,
+        obsBonus: 0,          // filled in index.ts
+        organicBonus: 0,      // filled in index.ts
+        smartWalletBonus: 0,  // filled in index.ts
+        creatorAgePenalty: 0,  // filled in index.ts
+        rugcheckPenalty: -rugcheckPenalty,
+        velocityPenalty: -velocityPenalty,
+        insiderPenalty: -insiderPenalty,
+        whalePenalty: -whalePenalty,
+        timingCvPenalty: -timingCvPenalty,
+      },
     };
 
     const nonPoolInfo = isPumpSwap && hold.holders.length > 2

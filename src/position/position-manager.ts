@@ -10,6 +10,7 @@ import { calculateMoonBag, shouldKeepMoonBag } from './moon-bag.js';
 import { TradeLogger } from '../data/trade-logger.js';
 import { getDb } from '../data/database.js';
 import { CreatorTracker } from '../analysis/creator-tracker.js';
+import { analyzeHolders, computeNonPoolHHI } from '../analysis/holder-analyzer.js';
 import { generateId, shortenAddress, formatSol, formatPct } from '../utils/helpers.js';
 import type { BotConfig, DetectedPool, Position, PoolSource, TradeResult } from '../types.js';
 import { WSOL_MINT } from '../constants.js';
@@ -67,6 +68,9 @@ export class PositionManager {
   // Data: 3/7 burst exits were false positives with healthy reserves ($50-80K liq)
   // Only emergency sell if reserve actually dropped, confirming drain
   private static readonly BURST_RESERVE_DROP_PCT = 20; // 20% reserve drop = confirmed rug
+  // v11o: HHI check timers — schedule 60s post-buy HHI check (data collection only)
+  private hhiCheckTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  private getConnectionFn: (() => Connection) | undefined;
   // Track consecutive stale (price=0) updates to detect drained pools
   private stalePriceCount = new Map<string, number>();
   // v9h: After N consecutive stale prices, trigger emergency sell
@@ -87,6 +91,7 @@ export class PositionManager {
     this.priceMonitor = new PriceMonitor(config.position.pricePollMs, getConnection);
     this.tradeLogger = new TradeLogger();
     this.creatorTracker = new CreatorTracker();
+    this.getConnectionFn = getConnection; // v11o: store for HHI tracking
 
     // v8s: WebSocket-based liquidity removal monitor (detects rugs 2-10s before polling)
     if (getConnection) {
@@ -199,6 +204,11 @@ export class PositionManager {
     }
     this.strandedTimers.clear();
     this.strandedStartedAt.clear();
+    // v11o: Clean up HHI check timers
+    for (const [, timer] of this.hhiCheckTimers) {
+      clearTimeout(timer);
+    }
+    this.hhiCheckTimers.clear();
     logger.info('[positions] Manager stopped');
   }
 
@@ -269,6 +279,13 @@ export class PositionManager {
     if (this.creatorMonitor && extra?.creatorAddress && pool.source === 'pumpswap') {
       this.creatorMonitor.subscribe(extra.creatorAddress, pool.poolAddress, pool.baseMint);
     }
+
+    // v11o: Schedule 60s HHI check (data collection only — NO action taken)
+    // Compares holder distribution at entry vs t+60s for outcome prediction research
+    if (this.getConnectionFn && pool.source === 'pumpswap') {
+      this.scheduleHHICheck(position.id, pool.baseMint);
+    }
+
     this.tradeLogger.savePosition(position);
 
     logger.info(
@@ -277,6 +294,52 @@ export class PositionManager {
 
     botEmitter.emit('positionOpened', position);
     return position;
+  }
+
+  /**
+   * v11o: Schedule HHI check 60s after opening a position.
+   * Compares holder distribution at entry vs t+60s.
+   * Data collection only — NO trade action taken.
+   */
+  private scheduleHHICheck(positionId: string, tokenMint: PublicKey): void {
+    const timer = setTimeout(async () => {
+      this.hhiCheckTimers.delete(positionId);
+      const position = this.positions.get(positionId);
+      if (!position || (position.status !== 'open' && position.status !== 'partial_close')) {
+        return; // Position already closed, skip RPC call
+      }
+      if (!this.getConnectionFn) return;
+      try {
+        const conn = this.getConnectionFn();
+        const hold = await analyzeHolders(conn, tokenMint);
+        const nonPoolHolders = hold.holders.slice(1, 6);
+        const concentrated60s = nonPoolHolders.reduce((sum, h) => sum + h.pct, 0);
+
+        this.tradeLogger.updatePositionHHI(positionId, {
+          hhi60s: hold.holderHHI,
+          holderCount60s: hold.holderCount,
+          concentrated60s,
+        });
+
+        logger.info(
+          `[hhi-track] ${shortenAddress(tokenMint)}: HHI=${hold.holderHHI.toFixed(2)}, ` +
+          `holders=${hold.holderCount}, concentrated=${concentrated60s.toFixed(1)}% (at t+60s)`,
+        );
+      } catch (err) {
+        logger.debug(`[hhi-track] Failed for ${shortenAddress(tokenMint)}: ${String(err).slice(0, 80)}`);
+      }
+    }, 60_000);
+
+    this.hhiCheckTimers.set(positionId, timer);
+  }
+
+  /** v11o: Cancel pending HHI check timer for a position */
+  private cancelHHICheck(positionId: string): void {
+    const timer = this.hhiCheckTimers.get(positionId);
+    if (timer) {
+      clearTimeout(timer);
+      this.hhiCheckTimers.delete(positionId);
+    }
   }
 
   getOpenPositions(): Position[] {
