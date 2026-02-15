@@ -163,15 +163,17 @@ export class TradeLogger {
       const db = getDb();
       db.prepare(`
         INSERT OR REPLACE INTO positions
-        (id, token_mint, pool_address, source, entry_price, current_price, peak_price,
+        (id, pool_id, token_mint, pool_address, source, entry_price, current_price, peak_price,
          token_amount, sol_invested, sol_returned, pnl_sol, pnl_pct, status,
          tp_levels_hit, security_score, opened_at, closed_at, updated_at,
          holder_count, liquidity_usd,
          exit_reason, peak_multiplier, time_to_peak_ms, sell_attempts, sell_successes,
-         bot_version, entry_latency_ms, sell_burst_count, total_sell_events, max_sell_burst)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         bot_version, entry_latency_ms, sell_burst_count, total_sell_events, max_sell_burst,
+         entry_reserve_lamports, current_reserve_lamports)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `).run(
         position.id,
+        position.poolId ?? null,
         position.tokenMint.toBase58(),
         position.poolAddress.toBase58(),
         position.source,
@@ -201,6 +203,8 @@ export class TradeLogger {
         position.sellBurstCount ?? 0,
         position.totalSellEvents ?? 0,
         position.maxSellBurst ?? 0,
+        position.entryReserveLamports ?? null,
+        position.currentReserveLamports ?? null,
       );
     } catch (err) {
       logger.error('[trade-logger] Failed to save position', { error: String(err) });
@@ -219,6 +223,8 @@ export class TradeLogger {
     elapsedMs: number,
     solReserveLamports?: number,
     sellCount?: number,
+    buyCount?: number,
+    cumulativeSellCount?: number,
   ): void {
     try {
       const db = getDb();
@@ -227,9 +233,9 @@ export class TradeLogger {
       const solReserveSol = solReserveLamports != null ? solReserveLamports / 1e9 : null;
       db.prepare(`
         INSERT INTO position_price_log
-          (position_id, price, multiplier, pnl_pct, elapsed_ms, sol_reserve, sell_count)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
-      `).run(positionId, price, multiplier, pnlPct, elapsedMs, solReserveSol, sellCount ?? 0);
+          (position_id, price, multiplier, pnl_pct, elapsed_ms, sol_reserve, sell_count, buy_count, cumulative_sell_count)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(positionId, price, multiplier, pnlPct, elapsedMs, solReserveSol, sellCount ?? 0, buyCount ?? 0, cumulativeSellCount ?? 0);
     } catch (err) {
       // Silently fail — non-critical data collection
     }

@@ -279,6 +279,12 @@ function initSchema(database: Database.Database): void {
     `ALTER TABLE positions ADD COLUMN holder_count_60s INTEGER`,
     `ALTER TABLE positions ADD COLUMN concentrated_entry REAL`,
     `ALTER TABLE positions ADD COLUMN concentrated_60s REAL`,
+    // v11o-data: ML data gaps — persist reserve at entry for rug detection analysis
+    `ALTER TABLE positions ADD COLUMN entry_reserve_lamports REAL`,
+    `ALTER TABLE positions ADD COLUMN current_reserve_lamports REAL`,
+    // v11o-data: buy_count in position_price_log for buy/sell ratio time-series
+    `ALTER TABLE position_price_log ADD COLUMN buy_count INTEGER DEFAULT 0`,
+    `ALTER TABLE position_price_log ADD COLUMN cumulative_sell_count INTEGER DEFAULT 0`,
   ];
   for (const sql of migrations) {
     try { database.exec(sql); } catch { /* column already exists */ }

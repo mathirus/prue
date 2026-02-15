@@ -245,6 +245,7 @@ export type PositionStatus = 'open' | 'partial_close' | 'closed' | 'stopped';
 
 export interface Position {
   id: string;
+  poolId?: string;              // v11o-data: links to detected_pools.id for JOIN queries
   tokenMint: PublicKey;
   poolAddress: PublicKey;
   source: PoolSource;

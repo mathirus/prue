@@ -123,7 +123,7 @@ export const JUPITER_API_BASE = 'https://public.jupiterapi.com';
 export const RUGCHECK_API_BASE = 'https://api.rugcheck.xyz/v1';
 
 // Bot version — updated on each meaningful code change for trade/rejection tracking
-export const BOT_VERSION = 'v11o';
+export const BOT_VERSION = 'v11p';
 
 // Solscan base URL
 export const SOLSCAN_BASE = 'https://solscan.io';

@@ -107,10 +107,10 @@ position:
   # Post-TP1: 8% (was 20%), Post-TP2: 5% (was 15%) — in stop-loss.ts
   # Trailing tighter = mathematically can't be worse (only changes exit timing)
   trailing_stop_pct: 10
-  # v11k: Moon bag 100% — keep ALL remaining tokens after last TP sell as moonbag
-  # After TP1 (80%) + TP2 (50% of remaining), 10% of original remains as moonbag.
-  # Moonbag trails with 10% trailing stop (set in stop-loss.ts, was 15% pre-v11k)
-  moon_bag_pct: 100
+  # v11o: Moon bag OFF — with single TP1@100%, moonbag has nothing to keep.
+  # moon_bag_pct=100 + TP1=100% caused trailing_stop to sell 0% (100-100=0) at 0.015 SOL.
+  # Re-enable with proper % when adding TP2/TP3 back.
+  moon_bag_pct: 0
   # Price monitoring interval
   price_poll_ms: 1500
   # v11i: Timeout 8 min (was 12). Data: winners avg 5.8 min, rugs avg 8.9 min.
@@ -131,7 +131,7 @@ risk:
   # Will raise to 0.05 when balance >= 0.25 SOL
   # v11a: Testing phase — 0.001 SOL/trade (minimum). Every trade loses to fees.
   # Goal: verify paid tier works (0 errors, sells execute). Scale after 5 clean trades.
-  max_position_sol: 0.001
+  max_position_sol: 0.015
   # v9v: max_concurrent=1 for overnight stability. Only 1 trade at a time = no RPC contention.
   max_concurrent: 1
   # Max trades per session (0 = unlimited)

@@ -73,6 +73,8 @@ export class PositionManager {
   private getConnectionFn: (() => Connection) | undefined;
   // Track consecutive stale (price=0) updates to detect drained pools
   private stalePriceCount = new Map<string, number>();
+  // v11p: Track positions where creator transfer was detected (combo accelerator: skip stale grace period)
+  private creatorTransferPositions = new Set<string>();
   // v9h: After N consecutive stale prices, trigger emergency sell
   // History: 3→6 (v9h, 429 false positives). 6→4 (v9y, sell-priority reduces 429 during sells)
   // v9y: With sell-priority mode, non-sell RPCs pause during sells → fewer false 429 stales.
@@ -239,6 +241,7 @@ export class PositionManager {
 
     const position: Position = {
       id: generateId(),
+      poolId: pool.id,
       tokenMint: pool.baseMint,
       poolAddress: pool.poolAddress,
       source: pool.source,
@@ -534,9 +537,9 @@ export class PositionManager {
   }
 
   /**
-   * v11n: Handle creator wallet events (sell/transfer/close_account).
-   * Creator selling their tokens is the #1 rug signal on PumpSwap.
-   * React: sell = emergency sell (critical), transfer = accelerate drain check (warning).
+   * v11n/v11p: Handle creator wallet events (sell/transfer/close_account).
+   * Creator selling OR transferring tokens is a rug signal on PumpSwap.
+   * v11p: Transfer now triggers emergency sell (HTxSdjmZ case: 7 transfers evaded detection).
    */
   private onCreatorAction(poolAddr: string, mintStr: string, eventType: CreatorEventType): void {
     for (const position of this.positions.values()) {
@@ -544,31 +547,28 @@ export class PositionManager {
       if (position.status !== 'open' && position.status !== 'partial_close') continue;
       if (this.sellingPositions.has(position.id)) continue;
 
-      if (eventType === 'sell') {
-        // Creator selling tokens = rug in progress → emergency sell
+      if (eventType === 'sell' || eventType === 'transfer') {
+        // v11p: Both sell AND transfer = rug signal → emergency sell
+        // Data: HTxSdjmZ creator did 7 transfers (not sells) to evade detection, -100% loss
+        const label = eventType === 'sell' ? 'SELL' : 'TRANSFER';
+        const reason = eventType === 'sell' ? 'creator_sell_detected' : 'creator_transfer_detected';
+        // v11p: Mark transfer for combo accelerator (skips stale grace period)
+        if (eventType === 'transfer') {
+          this.creatorTransferPositions.add(position.id);
+        }
         logger.warn(
-          `[positions] CREATOR SELL detected for ${shortenAddress(position.tokenMint)} — emergency sell`,
+          `[positions] CREATOR ${label} detected for ${shortenAddress(position.tokenMint)} — emergency sell`,
         );
         this.sellingPositions.add(position.id);
         this.priceMonitor.pause();
-        this.executeStopLoss(position, 'creator_sell_detected', true)
+        this.executeStopLoss(position, reason, true)
           .catch((err) => {
-            logger.error(`[positions] Creator sell emergency error: ${err}`);
+            logger.error(`[positions] Creator ${label.toLowerCase()} emergency error: ${err}`);
           })
           .finally(() => {
             this.sellingPositions.delete(position.id);
             this.priceMonitor.resume();
           });
-      } else if (eventType === 'transfer') {
-        // Creator transferring tokens to another wallet → possible preparation for rug
-        // Accelerate drain check (same as liq-monitor warning)
-        const currentStale = this.stalePriceCount.get(position.id) ?? 0;
-        if (currentStale < PositionManager.STALE_DRAIN_THRESHOLD - 1) {
-          this.stalePriceCount.set(position.id, PositionManager.STALE_DRAIN_THRESHOLD - 1);
-          logger.warn(
-            `[positions] Creator TRANSFER for ${shortenAddress(position.tokenMint)} — accelerating drain check`,
-          );
-        }
       }
       // close_account: just logged, no action needed (creator closing empty ATAs is normal)
     }
@@ -602,11 +602,19 @@ export class PositionManager {
 
         // v9h: Grace period — don't trigger STALE DRAIN in the first 30s
         // PriceMonitor needs time to initialize, and 429 storms cause temporary stale data
+        // v11p: Skip grace period if creator transfer was detected (combo accelerator)
         const positionAge = Date.now() - position.openedAt;
-        if (staleCount === PositionManager.STALE_DRAIN_THRESHOLD && positionAge >= PositionManager.STALE_DRAIN_GRACE_MS) {
-          logger.warn(
-            `[positions] STALE DRAIN: ${shortenAddress(position.tokenMint)} price unreadable for ${staleCount} polls (age=${Math.round(positionAge/1000)}s) - likely drained, emergency sell`,
-          );
+        const graceSkipped = this.creatorTransferPositions.has(position.id);
+        const pastGrace = graceSkipped || positionAge >= PositionManager.STALE_DRAIN_GRACE_MS;
+
+        // v11p: Changed === to >= so stale drain retries every poll (sellingPositions guard prevents concurrent)
+        // Previously only triggered once at exactly threshold=4, then never again if sell failed
+        if (staleCount >= PositionManager.STALE_DRAIN_THRESHOLD && pastGrace) {
+          if (staleCount === PositionManager.STALE_DRAIN_THRESHOLD) {
+            logger.warn(
+              `[positions] STALE DRAIN: ${shortenAddress(position.tokenMint)} price unreadable for ${staleCount} polls (age=${Math.round(positionAge/1000)}s${graceSkipped ? ', grace skipped: creator transfer' : ''}) - likely drained, emergency sell`,
+            );
+          }
           this.sellingPositions.add(position.id);
           this.priceMonitor.pause();
           this.executeStopLoss(position, 'rug_pull', true)
@@ -618,7 +626,7 @@ export class PositionManager {
               this.priceMonitor.resume();
             });
           continue;
-        } else if (staleCount >= PositionManager.STALE_DRAIN_THRESHOLD && positionAge < PositionManager.STALE_DRAIN_GRACE_MS) {
+        } else if (staleCount >= PositionManager.STALE_DRAIN_THRESHOLD && !pastGrace) {
           // v9h: Within grace period — log warning but don't sell
           if (staleCount === PositionManager.STALE_DRAIN_THRESHOLD) {
             logger.warn(
@@ -667,6 +675,8 @@ export class PositionManager {
         if (position.currentPrice > 0) {
           const poolStr = position.poolAddress.toBase58();
           const sellCount = this.liqMonitor?.getSellCount(poolStr) ?? 0;
+          // v11o-data: Also log buy_count and cumulative_sell_count for ML time-series
+          const { buys: recentBuys } = this.liqMonitor?.getBuySellRatio(poolStr) ?? { buys: 0 };
           this.tradeLogger.logPriceSnapshot(
             position.id,
             position.currentPrice,
@@ -675,6 +685,8 @@ export class PositionManager {
             now - position.openedAt,
             solReserveLamports,
             sellCount,
+            recentBuys,
+            sellCount, // cumulative sell count
           );
         }
         this.lastDbSave.set(position.id, now);
@@ -1023,6 +1035,7 @@ export class PositionManager {
       this.sellRetryAfter.delete(position.id);
       this.tpSellCooldownUntil.delete(position.id);
       this.tpSell429RetryCount.delete(position.id);
+      this.creatorTransferPositions.delete(position.id);
       botEmitter.emit('stopLossHit', position);
       botEmitter.emit('positionClosed', position);
       return;
@@ -1126,6 +1139,7 @@ export class PositionManager {
         this.tradeLogger.savePosition(position);
         this.sellRetries.delete(position.id);
         this.sellRetryAfter.delete(position.id);
+        this.creatorTransferPositions.delete(position.id);
       } catch (postSellErr) {
         // v9j: CRITICAL SAFETY NET — sell TX confirmed but post-processing failed
         // Force-close position so it doesn't block new trades
@@ -1240,6 +1254,7 @@ export class PositionManager {
     this.sellRetryAfter.delete(position.id);
     this.tpSellCooldownUntil.delete(position.id);
     this.tpSell429RetryCount.delete(position.id);
+    this.creatorTransferPositions.delete(position.id);
     botEmitter.emit('stopLossHit', position);
     botEmitter.emit('positionClosed', position);
   }
@@ -1393,6 +1408,7 @@ export class PositionManager {
     this.sellRetryAfter.delete(positionId);
     this.tpSellCooldownUntil.delete(positionId);
     this.tpSell429RetryCount.delete(positionId);
+    this.creatorTransferPositions.delete(positionId);
   }
 
   async closeAll(): Promise<void> {
