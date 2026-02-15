@@ -180,6 +180,10 @@ export interface SecurityChecks {
   washPenalty?: number;
   // v10f: Non-pool holder concentration (top5 non-pool holders as % of supply)
   nonPoolConcentration?: number;
+  // v11n: HHI of non-pool holders (0-1, >0.25 = concentrated)
+  holderHHI?: number;
+  // v11n: Timing cluster CV of bonding curve TXs (<0.3 = bot, >0.5 = organic)
+  timingClusterCV?: number;
 }
 
 // ─── Trade Execution ─────────────────────────────────────────────────

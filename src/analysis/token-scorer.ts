@@ -155,7 +155,7 @@ export class TokenScorer {
       // Bundle detection: count bonding curve TXs to detect coordinated launches
       isPumpSwap
         ? checkBundledLaunch(this.connection, baseMint, pool.poolCreationBlockTime)
-        : Promise.resolve({ txCount: -1, sameSlotCount: 0, isBundled: false, penalty: 0, graduationTimeSeconds: -1, earlyTxCount: 0, txVelocity: 0, uniqueSlots: 0 }),
+        : Promise.resolve({ txCount: -1, sameSlotCount: 0, isBundled: false, penalty: 0, graduationTimeSeconds: -1, earlyTxCount: 0, txVelocity: 0, uniqueSlots: 0, timingClusterCV: -1 }),
       // GoPlus Security API: catches Token-2022 scams (transfer hooks, balance mutation)
       // Note: for standard pump.fun tokens, GoPlus returns identical clean configs for both
       // rugs and winners - rug pulls on Solana are liquidity removal, not contract traps.
@@ -180,7 +180,7 @@ export class TokenScorer {
 
     const hold = holders.status === 'fulfilled'
       ? holders.value
-      : { topHolderPct: 100, top5HoldersPct: 100, top10HoldersPct: 100, holderCount: 0, holders: [] };
+      : { topHolderPct: 100, top5HoldersPct: 100, top10HoldersPct: 100, holderCount: 0, holders: [], holderHHI: 0 };
 
     const lp = lpStatus.status === 'fulfilled'
       ? lpStatus.value
@@ -190,7 +190,7 @@ export class TokenScorer {
 
     const bundle = bundleCheck.status === 'fulfilled'
       ? bundleCheck.value
-      : { txCount: -1, sameSlotCount: 0, isBundled: false, penalty: 0, graduationTimeSeconds: -1, earlyTxCount: 0, txVelocity: 0, uniqueSlots: 0 };
+      : { txCount: -1, sameSlotCount: 0, isBundled: false, penalty: 0, graduationTimeSeconds: -1, earlyTxCount: 0, txVelocity: 0, uniqueSlots: 0, timingClusterCV: -1 };
 
     const goplus = goplusCheck.status === 'fulfilled'
       ? goplusCheck.value
@@ -515,6 +515,23 @@ export class TokenScorer {
       // Note: cross-reference with coinCreator happens in index.ts where creator is available
     }
 
+    // v11n: HHI penalty — high concentration among non-pool holders
+    if (isPumpSwap && hold.holderHHI > 0) {
+      if (hold.holderHHI > 0.5) {
+        score -= 10;
+        logger.warn(`[scorer] ⚠️ HHI extreme: ${hold.holderHHI.toFixed(2)} (>0.5) → -10`);
+      } else if (hold.holderHHI > 0.25) {
+        score -= 5;
+        logger.warn(`[scorer] ⚠️ HHI high: ${hold.holderHHI.toFixed(2)} (>0.25) → -5`);
+      }
+    }
+
+    // v11n: Timing cluster CV penalty — evenly-spaced TXs = bot coordinated
+    if (bundle.timingClusterCV >= 0 && bundle.timingClusterCV < 0.3 && bundle.txCount >= 5) {
+      score -= 5;
+      logger.warn(`[scorer] ⚠️ Timing CV low: ${bundle.timingClusterCV.toFixed(2)} (<0.3, bot-like) → -5`);
+    }
+
     // Cap at 100
     score = Math.min(100, Math.max(0, score));
 
@@ -548,6 +565,9 @@ export class TokenScorer {
         : undefined,
       // v10f: Non-pool concentration for future analysis
       nonPoolConcentration: combinedNonPoolPct > 0 ? combinedNonPoolPct : undefined,
+      // v11n: HHI and timing CV
+      holderHHI: hold.holderHHI > 0 ? hold.holderHHI : undefined,
+      timingClusterCV: bundle.timingClusterCV >= 0 ? bundle.timingClusterCV : undefined,
     };
 
     const result: SecurityResult = {
@@ -726,13 +746,13 @@ export class TokenScorer {
         : Promise.resolve(null),
       isPumpSwap
         ? checkBundledLaunch(this.connection, baseMint, pool.poolCreationBlockTime)
-        : Promise.resolve({ txCount: -1, sameSlotCount: 0, isBundled: false, penalty: 0, graduationTimeSeconds: -1, earlyTxCount: 0, txVelocity: 0, uniqueSlots: 0 }),
+        : Promise.resolve({ txCount: -1, sameSlotCount: 0, isBundled: false, penalty: 0, graduationTimeSeconds: -1, earlyTxCount: 0, txVelocity: 0, uniqueSlots: 0, timingClusterCV: -1 }),
       isPumpSwap ? fetchInsiderGraph(baseMint) : Promise.resolve(null),
     ]);
 
     const hold = holders.status === 'fulfilled'
       ? holders.value
-      : { topHolderPct: 100, top5HoldersPct: 100, top10HoldersPct: 100, holderCount: 0, holders: [] };
+      : { topHolderPct: 100, top5HoldersPct: 100, top10HoldersPct: 100, holderCount: 0, holders: [], holderHHI: 0 };
     const hp = honeypot.status === 'fulfilled'
       ? honeypot.value
       : { isHoneypot: true, honeypotVerified: false, buyQuoteOk: false, sellQuoteOk: false, buyPriceImpact: 0, sellPriceImpact: 0 };
@@ -742,7 +762,7 @@ export class TokenScorer {
     const rc = rugcheck.status === 'fulfilled' ? rugcheck.value : null;
     const bundle = bundleCheck.status === 'fulfilled'
       ? bundleCheck.value
-      : { txCount: -1, sameSlotCount: 0, isBundled: false, penalty: 0, graduationTimeSeconds: -1, earlyTxCount: 0, txVelocity: 0, uniqueSlots: 0 };
+      : { txCount: -1, sameSlotCount: 0, isBundled: false, penalty: 0, graduationTimeSeconds: -1, earlyTxCount: 0, txVelocity: 0, uniqueSlots: 0, timingClusterCV: -1 };
     const insiderGraph: InsiderGraphResult | null = insiderGraphCheck.status === 'fulfilled'
       ? insiderGraphCheck.value
       : null;
@@ -902,6 +922,23 @@ export class TokenScorer {
       }
     }
 
+    // v11n: HHI penalty — high concentration among non-pool holders
+    if (isPumpSwap && hold.holderHHI > 0) {
+      if (hold.holderHHI > 0.5) {
+        delta -= 10;
+        logger.warn(`[scorer-deferred] HHI extreme: ${hold.holderHHI.toFixed(2)} (>0.5) → -10`);
+      } else if (hold.holderHHI > 0.25) {
+        delta -= 5;
+        logger.warn(`[scorer-deferred] HHI high: ${hold.holderHHI.toFixed(2)} (>0.25) → -5`);
+      }
+    }
+
+    // v11n: Timing cluster CV penalty — evenly-spaced TXs = bot coordinated
+    if (bundle.timingClusterCV >= 0 && bundle.timingClusterCV < 0.3 && bundle.txCount >= 5) {
+      delta -= 5;
+      logger.warn(`[scorer-deferred] Timing CV low: ${bundle.timingClusterCV.toFixed(2)} (<0.3, bot-like) → -5`);
+    }
+
     // Apply delta to fast score
     const newScore = Math.min(100, Math.max(0, fastResult.score + delta));
 
@@ -928,6 +965,9 @@ export class TokenScorer {
         : undefined,
       // v10f: Non-pool concentration for future analysis
       nonPoolConcentration: combinedNonPoolPct > 0 ? combinedNonPoolPct : undefined,
+      // v11n: HHI and timing CV
+      holderHHI: hold.holderHHI > 0 ? hold.holderHHI : undefined,
+      timingClusterCV: bundle.timingClusterCV >= 0 ? bundle.timingClusterCV : undefined,
     };
 
     const elapsed = Date.now() - startTime;
@@ -945,8 +985,10 @@ export class TokenScorer {
     const bundleInfo = bundle.txCount >= 0
       ? ` bcTxs=${bundle.txCount}${bundle.isBundled ? '⚠' : ''}`
       : '';
+    const hhiInfo = hold.holderHHI > 0 ? ` HHI=${hold.holderHHI.toFixed(2)}` : '';
+    const cvInfo = bundle.timingClusterCV >= 0 ? ` CV=${bundle.timingClusterCV.toFixed(2)}` : '';
     logger.info(`[analisis-deferred] ${shortenAddress(baseMint)} => ${fastResult.score}${delta >= 0 ? '+' : ''}${delta}=${newScore}/100 (${result.passed ? 'PASA' : 'FALLA'}) [${elapsed}ms]`);
-    logger.info(`[analisis-deferred]   holders=${hold.holderCount} top=${hold.topHolderPct.toFixed(1)}%${nonPoolInfo}${bundleInfo} rugcheck=${rc?.score ?? 'N/A'}`);
+    logger.info(`[analisis-deferred]   holders=${hold.holderCount} top=${hold.topHolderPct.toFixed(1)}%${nonPoolInfo}${bundleInfo}${hhiInfo}${cvInfo} rugcheck=${rc?.score ?? 'N/A'}`);
 
     return result;
   }

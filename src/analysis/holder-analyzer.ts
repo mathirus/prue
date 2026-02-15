@@ -12,6 +12,30 @@ export interface HolderAnalysis {
     pct: number;
     amount: string;
   }>;
+  // v11n: Herfindahl-Hirschman Index of non-pool holders (skip holders[0] = pool vault)
+  // HHI > 0.25 = highly concentrated (DOJ antitrust threshold), > 0.5 = extreme
+  // 0 extra RPC calls — computed from existing holders data
+  holderHHI: number;
+}
+
+/**
+ * v11n: Calculate Herfindahl-Hirschman Index for non-pool holders.
+ * Skips holders[0] (pool vault, typically 80-97% of supply) and computes
+ * HHI on the remaining holders' relative shares.
+ * HHI = sum((share_i / total_non_pool)^2)
+ * Range: 0 (perfectly distributed) to 1 (single holder has everything)
+ * Thresholds: >0.25 = highly concentrated, >0.5 = extreme concentration
+ */
+function computeNonPoolHHI(holders: Array<{ pct: number }>): number {
+  if (holders.length <= 1) return 0; // Only pool vault or empty
+  const nonPool = holders.slice(1); // Skip pool vault (holders[0])
+  const totalNonPoolPct = nonPool.reduce((sum, h) => sum + h.pct, 0);
+  if (totalNonPoolPct <= 0) return 0;
+  // Normalize shares relative to non-pool total, then compute HHI
+  return nonPool.reduce((sum, h) => {
+    const share = h.pct / totalNonPoolPct;
+    return sum + share * share;
+  }, 0);
 }
 
 /**
@@ -37,6 +61,7 @@ export async function analyzeHolders(
         top10HoldersPct: 100,
         holderCount: 0,
         holders: [],
+        holderHHI: 0,
       };
     }
 
@@ -53,6 +78,7 @@ export async function analyzeHolders(
         top10HoldersPct: 0,
         holderCount: largestAccounts.value.length,
         holders: [],
+        holderHHI: 0,
       };
     }
 
@@ -75,6 +101,7 @@ export async function analyzeHolders(
       top10HoldersPct,
       holderCount: holders.length,
       holders: holders.slice(0, 20), // Top 20
+      holderHHI: computeNonPoolHHI(holders),
     };
   } catch (err) {
     const errStr = String(err);
@@ -102,6 +129,7 @@ export async function analyzeHolders(
         top10HoldersPct: 85,
         holderCount: -1, // -1 signals "unknown"
         holders: [],
+        holderHHI: 0,
       };
     }
     logger.error(`[holders] Analysis failed for ${mintAddress.toBase58()}`, {
@@ -113,6 +141,7 @@ export async function analyzeHolders(
       top10HoldersPct: 100,
       holderCount: 0,
       holders: [],
+      holderHHI: 0,
     };
   }
 }
@@ -169,5 +198,6 @@ async function fetchHeliusDasHolders(
     top10HoldersPct: holders.slice(0, 10).reduce((sum, h) => sum + h.pct, 0),
     holderCount: holders.length,
     holders: holders.slice(0, 20),
+    holderHHI: computeNonPoolHHI(holders),
   };
 }

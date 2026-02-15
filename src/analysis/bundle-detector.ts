@@ -28,6 +28,37 @@ export interface BundleCheckResult {
   earlyTxCount: number;         // TXs in the first 60s of the token's life
   txVelocity: number;           // TXs per minute during bonding curve
   uniqueSlots: number;          // Distinct slots across all TXs (temporal diversity)
+  // v11n: Coefficient of Variation of inter-TX time gaps
+  // Low CV (<0.3) = evenly-spaced bot TXs (coordinated), High CV (>0.5) = organic/random
+  // -1 if insufficient data (<3 TXs with blockTime)
+  timingClusterCV: number;
+}
+
+/**
+ * v11n: Compute Coefficient of Variation of inter-transaction time gaps.
+ * CV = stddev(gaps) / mean(gaps). Low CV = evenly spaced (bot), high CV = random (organic).
+ * Returns -1 if insufficient data (<3 TXs with blockTime → <2 gaps).
+ */
+function computeTimingCV(sigs: ConfirmedSignatureInfo[]): number {
+  // Extract blockTimes, filter nulls, sort ascending (oldest first)
+  const times = sigs
+    .filter(s => s.blockTime != null)
+    .map(s => s.blockTime!)
+    .sort((a, b) => a - b);
+  if (times.length < 3) return -1; // Need at least 2 gaps
+
+  // Calculate inter-TX gaps in seconds
+  const gaps: number[] = [];
+  for (let i = 1; i < times.length; i++) {
+    gaps.push(times[i] - times[i - 1]);
+  }
+  if (gaps.length < 2) return -1;
+
+  const mean = gaps.reduce((s, g) => s + g, 0) / gaps.length;
+  if (mean === 0) return 0; // All same-second → CV=0 (perfectly coordinated)
+
+  const variance = gaps.reduce((s, g) => s + (g - mean) ** 2, 0) / gaps.length;
+  return Math.sqrt(variance) / mean;
 }
 
 /**
@@ -97,7 +128,7 @@ export async function checkBundledLaunch(
         ? `${Math.floor(fallbackGradTime / 60)}m${fallbackGradTime % 60}s (mint-fallback)`
         : 'N/A';
       logger.debug(`[bundle] No bonding curve history for ${tokenMint.toBase58().slice(0, 8)}... gradTime=${gradStr}`);
-      return { txCount: 0, sameSlotCount: 0, isBundled: false, penalty: 0, graduationTimeSeconds: fallbackGradTime, earlyTxCount: 0, txVelocity: 0, uniqueSlots: 0 };
+      return { txCount: 0, sameSlotCount: 0, isBundled: false, penalty: 0, graduationTimeSeconds: fallbackGradTime, earlyTxCount: 0, txVelocity: 0, uniqueSlots: 0, timingClusterCV: -1 };
     }
 
     // Cache sigs for wash-trading-detector (0 extra RPC calls)
@@ -156,9 +187,15 @@ export async function checkBundledLaunch(
       `[bundle] ${tokenMint.toBase58().slice(0, 8)}...: txCount=${txCount} sameSlot=${sameSlotCount} gradTime=${gradStr} early60s=${earlyTxCount} vel=${txVelocity}tx/min slots=${uniqueSlots} penalty=${penalty}${isBundled ? ' BUNDLED' : ''}`,
     );
 
-    return { txCount, sameSlotCount, isBundled, penalty, graduationTimeSeconds, earlyTxCount, txVelocity, uniqueSlots };
+    // v11n: Timing cluster CV — computed from existing sigs (0 extra RPC)
+    const timingClusterCV = computeTimingCV(sigs);
+    if (timingClusterCV >= 0) {
+      logger.debug(`[bundle] ${tokenMint.toBase58().slice(0, 8)}... timingCV=${timingClusterCV.toFixed(2)} (${timingClusterCV < 0.3 ? 'BOT' : timingClusterCV > 0.5 ? 'organic' : 'mixed'})`);
+    }
+
+    return { txCount, sameSlotCount, isBundled, penalty, graduationTimeSeconds, earlyTxCount, txVelocity, uniqueSlots, timingClusterCV };
   } catch (err) {
     logger.debug(`[bundle] Check failed for ${tokenMint.toBase58().slice(0, 8)}...: ${String(err)}`);
-    return { txCount: -1, sameSlotCount: 0, isBundled: false, penalty: 0, graduationTimeSeconds: -1, earlyTxCount: 0, txVelocity: 0, uniqueSlots: 0 };
+    return { txCount: -1, sameSlotCount: 0, isBundled: false, penalty: 0, graduationTimeSeconds: -1, earlyTxCount: 0, txVelocity: 0, uniqueSlots: 0, timingClusterCV: -1 };
   }
 }

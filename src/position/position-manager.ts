@@ -3,6 +3,7 @@ import { logger } from '../utils/logger.js';
 import { botEmitter } from '../detection/event-emitter.js';
 import { PriceMonitor } from './price-monitor.js';
 import { LiquidityRemovalMonitor, type LiqEventSeverity } from './liq-removal-monitor.js';
+import { CreatorWalletMonitor, type CreatorEventType } from './creator-wallet-monitor.js';
 import { evaluateTakeProfit, calculateSellAmount, type TakeProfitAction } from './take-profit.js';
 import { evaluateStopLoss } from './stop-loss.js';
 import { calculateMoonBag, shouldKeepMoonBag } from './moon-bag.js';
@@ -25,6 +26,7 @@ export class PositionManager {
   private positions = new Map<string, Position>();
   private priceMonitor: PriceMonitor;
   private liqMonitor: LiquidityRemovalMonitor | null = null; // v8s: WebSocket liquidity removal detection
+  private creatorMonitor: CreatorWalletMonitor | null = null; // v11n: WebSocket creator wallet monitoring
   private tradeLogger: TradeLogger;
   private creatorTracker: CreatorTracker;
   // Lock to prevent concurrent sells on the same position
@@ -91,6 +93,12 @@ export class PositionManager {
       this.liqMonitor = new LiquidityRemovalMonitor(getConnection);
       this.liqMonitor.onLiquidityRemoved((poolAddr, mintStr, severity, burstCount) => {
         this.onLiquidityRemoved(poolAddr, mintStr, severity, burstCount);
+      });
+
+      // v11n: WebSocket-based creator wallet monitor (detects creator sells 200-500ms from TX confirm)
+      this.creatorMonitor = new CreatorWalletMonitor(getConnection);
+      this.creatorMonitor.onCreatorAction((poolAddr, mintStr, eventType) => {
+        this.onCreatorAction(poolAddr, mintStr, eventType);
       });
     }
 
@@ -183,6 +191,7 @@ export class PositionManager {
   stop(): void {
     this.priceMonitor.stop();
     this.liqMonitor?.stop(); // v8s
+    this.creatorMonitor?.stop(); // v11n
     // v9i: Clean up stranded retry timers
     for (const [posId, timer] of this.strandedTimers) {
       clearInterval(timer);
@@ -210,7 +219,7 @@ export class PositionManager {
     solInvested: number,
     securityScore: number,
     initialSolReserve?: number,
-    extra?: { holderCount?: number; liquidityUsd?: number; mintAuthRevoked?: boolean; freezeAuthRevoked?: boolean },
+    extra?: { holderCount?: number; liquidityUsd?: number; mintAuthRevoked?: boolean; freezeAuthRevoked?: boolean; creatorAddress?: string },
   ): Position {
     // Prevent duplicate positions for the same token
     if (this.hasActivePosition(pool.baseMint)) {
@@ -255,6 +264,10 @@ export class PositionManager {
     // v8s: Subscribe to WebSocket liquidity removal monitor for instant rug detection
     if (this.liqMonitor && pool.source === 'pumpswap') {
       this.liqMonitor.subscribe(pool.poolAddress, pool.baseMint);
+    }
+    // v11n: Subscribe to creator wallet monitor (detects creator sells ~200-500ms from TX)
+    if (this.creatorMonitor && extra?.creatorAddress && pool.source === 'pumpswap') {
+      this.creatorMonitor.subscribe(extra.creatorAddress, pool.poolAddress, pool.baseMint);
     }
     this.tradeLogger.savePosition(position);
 
@@ -454,6 +467,47 @@ export class PositionManager {
           );
         }
       }
+    }
+  }
+
+  /**
+   * v11n: Handle creator wallet events (sell/transfer/close_account).
+   * Creator selling their tokens is the #1 rug signal on PumpSwap.
+   * React: sell = emergency sell (critical), transfer = accelerate drain check (warning).
+   */
+  private onCreatorAction(poolAddr: string, mintStr: string, eventType: CreatorEventType): void {
+    for (const position of this.positions.values()) {
+      if (position.tokenMint.toBase58() !== mintStr) continue;
+      if (position.status !== 'open' && position.status !== 'partial_close') continue;
+      if (this.sellingPositions.has(position.id)) continue;
+
+      if (eventType === 'sell') {
+        // Creator selling tokens = rug in progress → emergency sell
+        logger.warn(
+          `[positions] CREATOR SELL detected for ${shortenAddress(position.tokenMint)} — emergency sell`,
+        );
+        this.sellingPositions.add(position.id);
+        this.priceMonitor.pause();
+        this.executeStopLoss(position, 'creator_sell_detected', true)
+          .catch((err) => {
+            logger.error(`[positions] Creator sell emergency error: ${err}`);
+          })
+          .finally(() => {
+            this.sellingPositions.delete(position.id);
+            this.priceMonitor.resume();
+          });
+      } else if (eventType === 'transfer') {
+        // Creator transferring tokens to another wallet → possible preparation for rug
+        // Accelerate drain check (same as liq-monitor warning)
+        const currentStale = this.stalePriceCount.get(position.id) ?? 0;
+        if (currentStale < PositionManager.STALE_DRAIN_THRESHOLD - 1) {
+          this.stalePriceCount.set(position.id, PositionManager.STALE_DRAIN_THRESHOLD - 1);
+          logger.warn(
+            `[positions] Creator TRANSFER for ${shortenAddress(position.tokenMint)} — accelerating drain check`,
+          );
+        }
+      }
+      // close_account: just logged, no action needed (creator closing empty ATAs is normal)
     }
   }
 
@@ -768,6 +822,7 @@ export class PositionManager {
           : 0;
         this.priceMonitor.removeToken(position.tokenMint);
         this.liqMonitor?.unsubscribe(position.poolAddress);
+        this.creatorMonitor?.unsubscribe(position.poolAddress);
         this.tradeLogger.savePosition(position);
         this.recordOutcome(position);
         this.sellRetries.delete(position.id);
@@ -793,6 +848,7 @@ export class PositionManager {
           position.exitReason = 'tp_complete';
           this.priceMonitor.removeToken(position.tokenMint);
           this.liqMonitor?.unsubscribe(position.poolAddress);
+        this.creatorMonitor?.unsubscribe(position.poolAddress);
           this.recordOutcome(position);
         }
       } else {
@@ -864,6 +920,7 @@ export class PositionManager {
             : 0;
           this.priceMonitor.removeToken(position.tokenMint);
           this.liqMonitor?.unsubscribe(position.poolAddress);
+        this.creatorMonitor?.unsubscribe(position.poolAddress);
           this.tradeLogger.savePosition(position);
           this.positions.delete(position.id);
           this.sellingPositions.delete(position.id);
@@ -896,6 +953,7 @@ export class PositionManager {
         : 0;
       this.priceMonitor.removeToken(position.tokenMint);
       this.liqMonitor?.unsubscribe(position.poolAddress);
+        this.creatorMonitor?.unsubscribe(position.poolAddress);
       this.tradeLogger.savePosition(position);
       this.recordOutcome(position);
       this.sellRetries.delete(position.id);
@@ -930,6 +988,7 @@ export class PositionManager {
       position.exitReason = reason;
       this.priceMonitor.removeToken(position.tokenMint);
       this.liqMonitor?.unsubscribe(position.poolAddress);
+        this.creatorMonitor?.unsubscribe(position.poolAddress);
       this.sellRetries.delete(position.id);
       botEmitter.emit('stopLossHit', position);
       botEmitter.emit('positionClosed', position);
@@ -991,6 +1050,7 @@ export class PositionManager {
           position.exitReason = reason;
           this.priceMonitor.removeToken(position.tokenMint);
           this.liqMonitor?.unsubscribe(position.poolAddress);
+        this.creatorMonitor?.unsubscribe(position.poolAddress);
           this.recordOutcome(position);
         }
 
@@ -1014,7 +1074,8 @@ export class PositionManager {
         position.tokenAmount = 0;
         try { this.tradeLogger.savePosition(position); } catch { /* last resort */ }
         try { this.priceMonitor.removeToken(position.tokenMint); } catch { /* */ }
-        try { this.liqMonitor?.unsubscribe(position.poolAddress); } catch { /* */ }
+        try { this.liqMonitor?.unsubscribe(position.poolAddress);
+        this.creatorMonitor?.unsubscribe(position.poolAddress); } catch { /* */ }
       }
 
       this.tradeLogger.logTrade(
@@ -1063,6 +1124,7 @@ export class PositionManager {
             : 0;
         this.priceMonitor.removeToken(position.tokenMint);
         this.liqMonitor?.unsubscribe(position.poolAddress);
+        this.creatorMonitor?.unsubscribe(position.poolAddress);
         this.tradeLogger.savePosition(position);
         this.recordOutcome(position);
         this.sellRetries.delete(position.id);
@@ -1108,6 +1170,7 @@ export class PositionManager {
       : 0;
     this.priceMonitor.removeToken(position.tokenMint);
     this.liqMonitor?.unsubscribe(position.poolAddress);
+        this.creatorMonitor?.unsubscribe(position.poolAddress);
     this.tradeLogger.savePosition(position);
     this.recordOutcome(position);
     this.sellRetries.delete(position.id);
@@ -1212,6 +1275,7 @@ export class PositionManager {
 
         this.priceMonitor.removeToken(position.tokenMint);
         this.liqMonitor?.unsubscribe(position.poolAddress);
+        this.creatorMonitor?.unsubscribe(position.poolAddress);
         this.tradeLogger.savePosition(position);
         this.recordOutcome(position);
 

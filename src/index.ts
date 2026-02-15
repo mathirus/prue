@@ -125,6 +125,8 @@ import { startAtaCleanup, closeTokenAta } from './utils/ata-cleanup.js';
 import { scheduleMissedGainsCheck, backfillMissedGains } from './analysis/missed-gains-tracker.js';
 import { checkWashTrading, type WashTradingResult } from './analysis/wash-trading-detector.js';
 import { checkCoordinatedLaunch, type CoordinatedLaunchResult } from './analysis/coordinated-launch-detector.js';
+import { checkOrganicBuyers, type OrganicBuyerResult } from './analysis/organic-buyer-checker.js';
+import { checkSmartWallets, type SmartWalletResult } from './analysis/smart-wallet-checker.js';
 import { WSOL_MINT } from './constants.js';
 import { startBlockhashCache, stopBlockhashCache } from './utils/blockhash-cache.js';
 import { withAnalysisRetry, enterSellPriority, exitSellPriority, setAtCapacity } from './utils/analysis-rpc.js';
@@ -200,7 +202,7 @@ async function main(): Promise<void> {
   await cache.init();
 
   // v8s: Start blockhash pre-cache (refreshes every 400ms, saves 100-300ms per TX)
-  startBlockhashCache(() => rpcManager.primaryConnection, () => rpcManager.isUnderPressure);
+  startBlockhashCache(() => rpcManager.primaryConnection);
 
   // Setup wallet
   let wallet: Wallet | undefined;
@@ -228,7 +230,7 @@ async function main(): Promise<void> {
       }
       // v9w: Start background balance updater (30s interval, uses backup RPCs)
       // v11j: Pass getter function so balance updater always uses fresh connection after reset
-      startBalanceUpdater(wallet.publicKey, () => rpcManager.primaryConnection, 15_000, () => rpcManager.isUnderPressure);
+      startBalanceUpdater(wallet.publicKey, () => rpcManager.primaryConnection, 15_000);
     }
   }
 
@@ -1337,6 +1339,8 @@ async function main(): Promise<void> {
       const obsConfig = config.analysis.observationWindow;
       let washResult: WashTradingResult | null = null;
       let coordinatedResult: CoordinatedLaunchResult | null = null;
+      let organicResult: OrganicBuyerResult | null = null;
+      let smartWalletResult: SmartWalletResult | null = null;
       let observationResult: { stable: boolean; dropPct: number; elapsedMs: number; initialSolReserve: number; finalSolReserve: number } | null = null;
 
       if (obsConfig.enabled && pool.source === 'pumpswap' && pumpSwapSwap) {
@@ -1350,8 +1354,10 @@ async function main(): Promise<void> {
 
         let washCheck: WashTradingResult;
         let coordCheck: CoordinatedLaunchResult;
+        let organicCheck: OrganicBuyerResult;
+        let smartCheck: SmartWalletResult;
         try {
-          [observationResult, washCheck, coordCheck] = await Promise.race([
+          [observationResult, washCheck, coordCheck, organicCheck, smartCheck] = await Promise.race([
             Promise.all([
               pumpSwapSwap.observePool(pool, {
                 durationMs: obsConfig.durationMs,
@@ -1366,6 +1372,10 @@ async function main(): Promise<void> {
                 coinCreator,
                 creatorDeepProfile?.fundingSource ?? null,
               ),
+              // v11n: Organic buyer check — count unique non-creator buyers (~1-5 RPC calls)
+              checkOrganicBuyers(rpcManager.connection, pool.poolAddress, coinCreator),
+              // v11n: Smart wallet check — batch ATA lookup (1 RPC call)
+              checkSmartWallets(rpcManager.connection, pool.baseMint),
             ]),
             obsTimeout,
           ]);
@@ -1374,10 +1384,14 @@ async function main(): Promise<void> {
           observationResult = { stable: true, dropPct: 0, elapsedMs: OBS_GLOBAL_TIMEOUT_MS, initialSolReserve: 0, finalSolReserve: 0 };
           washCheck = { penalty: 0, walletConcentration: 0, sameAmountRatio: 0, uniqueWallets: 0, totalTxsSampled: 0 };
           coordCheck = { buyerCount: 0, sharedFunderCount: 0, selfBuyDetected: false, penalty: 0, reason: 'timeout' };
+          organicCheck = { uniqueBuyers: 0, totalTxsSampled: 0, buyerConcentration: 0, bonus: 0, reason: 'timeout' };
+          smartCheck = { holdingCount: 0, eliteCount: 0, strongCount: 0, consistentCount: 0, bonus: 0, wallets: [] };
         }
 
         washResult = washCheck;
         coordinatedResult = coordCheck;
+        organicResult = organicCheck;
+        smartWalletResult = smartCheck;
 
         if (!observationResult.stable) {
           // v11h: Insert row FIRST so observation + rejection UPDATEs find it
@@ -1546,6 +1560,26 @@ async function main(): Promise<void> {
             security.passed = security.score >= config.analysis.minScore;
             logger.info(`[bot] Reserve growth bonus: reserves grew ${reserveGrowthPct.toFixed(1)}% +${bonus} (obs total: +${totalObservationBonus}/${OBS_BONUS_CAP}) → score ${oldScore}→${security.score}`);
           }
+        }
+      }
+
+      // v11n: Organic buyer bonus/penalty — unique buyers on pool early lifecycle
+      if (organicResult && organicResult.bonus !== 0) {
+        const oldScore = security.score;
+        security.score = Math.max(0, Math.min(100, security.score + organicResult.bonus));
+        security.passed = security.score >= config.analysis.minScore;
+        logger.info(`[bot] Organic buyers: ${organicResult.uniqueBuyers} unique, ${organicResult.reason} → ${organicResult.bonus > 0 ? '+' : ''}${organicResult.bonus} score ${oldScore}→${security.score}`);
+      }
+
+      // v11n: Smart wallet bonus — known profitable wallets holding this token
+      if (smartWalletResult && smartWalletResult.bonus > 0) {
+        const oldScore = security.score;
+        const bonus = Math.min(smartWalletResult.bonus, OBS_BONUS_CAP - totalObservationBonus);
+        if (bonus > 0) {
+          security.score = Math.min(100, security.score + bonus);
+          totalObservationBonus += bonus;
+          security.passed = security.score >= config.analysis.minScore;
+          logger.info(`[bot] Smart wallets: ${smartWalletResult.holdingCount} holding (elite=${smartWalletResult.eliteCount}) → +${bonus} (obs total: +${totalObservationBonus}/${OBS_BONUS_CAP}) score ${oldScore}→${security.score}`);
         }
       }
 
@@ -1787,6 +1821,8 @@ async function main(): Promise<void> {
             // v8r: Pass authority state for post-buy re-enablement detection
             mintAuthRevoked: security.checks.mintAuthorityRevoked,
             freezeAuthRevoked: security.checks.freezeAuthorityRevoked,
+            // v11n: Pass creator address for WebSocket monitoring
+            creatorAddress: coinCreator ?? undefined,
           },
         );
 
