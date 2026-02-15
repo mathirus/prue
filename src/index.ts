@@ -124,6 +124,7 @@ import { shortenAddress, solscanTx, formatSol, solToLamports } from './utils/hel
 import { startAtaCleanup, closeTokenAta } from './utils/ata-cleanup.js';
 import { scheduleMissedGainsCheck, backfillMissedGains } from './analysis/missed-gains-tracker.js';
 import { checkWashTrading, type WashTradingResult } from './analysis/wash-trading-detector.js';
+import { checkCoordinatedLaunch, type CoordinatedLaunchResult } from './analysis/coordinated-launch-detector.js';
 import { WSOL_MINT } from './constants.js';
 import { startBlockhashCache, stopBlockhashCache } from './utils/blockhash-cache.js';
 import { withAnalysisRetry, enterSellPriority, exitSellPriority, setAtCapacity } from './utils/analysis-rpc.js';
@@ -199,7 +200,7 @@ async function main(): Promise<void> {
   await cache.init();
 
   // v8s: Start blockhash pre-cache (refreshes every 400ms, saves 100-300ms per TX)
-  startBlockhashCache(() => rpcManager.primaryConnection);
+  startBlockhashCache(() => rpcManager.primaryConnection, () => rpcManager.isUnderPressure);
 
   // Setup wallet
   let wallet: Wallet | undefined;
@@ -227,7 +228,7 @@ async function main(): Promise<void> {
       }
       // v9w: Start background balance updater (30s interval, uses backup RPCs)
       // v11j: Pass getter function so balance updater always uses fresh connection after reset
-      startBalanceUpdater(wallet.publicKey, () => rpcManager.primaryConnection);
+      startBalanceUpdater(wallet.publicKey, () => rpcManager.primaryConnection, 15_000, () => rpcManager.isUnderPressure);
     }
   }
 
@@ -1329,15 +1330,17 @@ async function main(): Promise<void> {
       // Runs slow checks (holders, rugcheck, bundles, insiders) during observation window
       const deferredPromise = scorer.scoreDeferred(pool, fastSecurity);
 
-      // OBSERVATION WINDOW + WASH TRADING (v8l): run in parallel (0 extra latency)
-      // Observation: watch pool reserves for ~3s to catch fast rug pulls
+      // OBSERVATION WINDOW + WASH TRADING + COORDINATED LAUNCH (v8l/v11m): run in parallel
+      // Observation: watch pool reserves for ~10s to catch fast rug pulls
       // Wash trading: analyze bonding curve TXs for coordinated patterns (~500ms)
+      // Coordinated launch: check if first buyers share funder with creator (~2s)
       const obsConfig = config.analysis.observationWindow;
       let washResult: WashTradingResult | null = null;
+      let coordinatedResult: CoordinatedLaunchResult | null = null;
       let observationResult: { stable: boolean; dropPct: number; elapsedMs: number; initialSolReserve: number; finalSolReserve: number } | null = null;
 
       if (obsConfig.enabled && pool.source === 'pumpswap' && pumpSwapSwap) {
-        logger.info(`[bot] 👁️ Observation window: monitoring pool for ${obsConfig.durationMs / 1000}s + wash trading check...`);
+        logger.info(`[bot] 👁️ Observation window: monitoring pool for ${obsConfig.durationMs / 1000}s + wash/coordinated checks...`);
 
         // v9u: Global timeout (30s) prevents observation from hanging for minutes when RPCs are slow
         const OBS_GLOBAL_TIMEOUT_MS = 30_000;
@@ -1346,8 +1349,9 @@ async function main(): Promise<void> {
         );
 
         let washCheck: WashTradingResult;
+        let coordCheck: CoordinatedLaunchResult;
         try {
-          [observationResult, washCheck] = await Promise.race([
+          [observationResult, washCheck, coordCheck] = await Promise.race([
             Promise.all([
               pumpSwapSwap.observePool(pool, {
                 durationMs: obsConfig.durationMs,
@@ -1355,6 +1359,13 @@ async function main(): Promise<void> {
                 maxDropPct: obsConfig.maxDropPct,
               }),
               checkWashTrading(rpcManager.connection, pool.baseMint),
+              // v11m: Coordinated launch check — runs in parallel (0 extra latency)
+              checkCoordinatedLaunch(
+                rpcManager.connection,
+                pool.baseMint,
+                coinCreator,
+                creatorDeepProfile?.fundingSource ?? null,
+              ),
             ]),
             obsTimeout,
           ]);
@@ -1362,9 +1373,11 @@ async function main(): Promise<void> {
           logger.warn(`[bot] ⚠️ ${String(obsErr)} — passing through (buy sim will validate)`);
           observationResult = { stable: true, dropPct: 0, elapsedMs: OBS_GLOBAL_TIMEOUT_MS, initialSolReserve: 0, finalSolReserve: 0 };
           washCheck = { penalty: 0, walletConcentration: 0, sameAmountRatio: 0, uniqueWallets: 0, totalTxsSampled: 0 };
+          coordCheck = { buyerCount: 0, sharedFunderCount: 0, selfBuyDetected: false, penalty: 0, reason: 'timeout' };
         }
 
         washResult = washCheck;
+        coordinatedResult = coordCheck;
 
         if (!observationResult.stable) {
           // v11h: Insert row FIRST so observation + rejection UPDATEs find it
@@ -1414,11 +1427,27 @@ async function main(): Promise<void> {
         security.checks.washPenalty = washResult.penalty;
       }
 
+      // v11m: Coordinated launch penalty — creator self-buy or shared funder with early buyers
+      if (coordinatedResult && coordinatedResult.penalty < 0) {
+        const oldScore = security.score;
+        security.score = Math.max(0, security.score + coordinatedResult.penalty);
+        security.passed = security.score >= config.analysis.minScore;
+        logger.warn(`[bot] Coordinated launch: ${coordinatedResult.reason} → penalty ${coordinatedResult.penalty} score ${oldScore}→${security.score}`);
+      }
+
+      // v11l: Creator profile timeout penalty — can't verify funder = slight penalty on borderline tokens
+      if (!creatorDeepProfile && security.score < 75) {
+        const oldScore = security.score;
+        security.score = Math.max(0, security.score - 3);
+        security.passed = security.score >= config.analysis.minScore;
+        logger.warn(`[bot] Creator profile timeout → -3 penalty (can't verify funder) score ${oldScore}→${security.score}`);
+      }
+
       // v10d: Observation window scoring — reward stable pools, penalize extreme drops
       // v11g: Total observation bonus capped at +10 (was uncapped, could reach +20)
       // HYNusnhz had score 53 inflated to 68 via +15 bonus → honeypot bought and unsellable
       let totalObservationBonus = 0;
-      const OBS_BONUS_CAP = 15;
+      const OBS_BONUS_CAP = 10;
       if (observationResult) {
         const oldScore = security.score;
         if (observationResult.stable) {

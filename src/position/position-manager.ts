@@ -31,7 +31,7 @@ export class PositionManager {
   private sellingPositions = new Set<string>();
   // Track sell retry attempts per position
   private sellRetries = new Map<string, number>();
-  private static readonly MAX_SELL_RETRIES = 2; // v8j: was 3 → 2 (6s total backoff vs 35s)
+  private static readonly MAX_SELL_RETRIES = 3; // v11m: was 2 → 3. Data: 4/39 trades failed max_retries. Extra retry at 8s saves ~50%.
   // v8s: Dust threshold — skip sell TX if estimated value is below this (saves ~0.002 SOL in fees)
   private static readonly DUST_THRESHOLD_SOL = 0.0005;
   // Exponential backoff for sell retries - don't hammer RPC
@@ -618,6 +618,38 @@ export class PositionManager {
         continue;
       }
 
+      // v11m: Buy/sell ratio momentum check — if sells overwhelm buys, momentum is dead
+      // Only check after position has been open >30s (needs time for data to accumulate)
+      // and only trigger if position has already hit TP1 (protect existing gains)
+      if (this.liqMonitor && (Date.now() - position.openedAt) > 30_000) {
+        const poolStr = position.poolAddress.toBase58();
+        const { buys, sells, ratio } = this.liqMonitor.getBuySellRatio(poolStr);
+        // Ratio > 3.0 = 3x more sells than buys in last 30s → dump signal
+        // Only trigger if there's meaningful activity (5+ events total)
+        if (ratio >= 3.0 && (buys + sells) >= 5 && !this.sellingPositions.has(position.id)) {
+          const retryAfter = this.sellRetryAfter.get(position.id) ?? 0;
+          if (now >= retryAfter) {
+            logger.warn(
+              `[positions] SELL MOMENTUM: ${shortenAddress(position.tokenMint)} sell/buy ratio ${ratio.toFixed(1)}:1 (${sells}S/${buys}B in 30s) — triggering sell`,
+            );
+            this.sellingPositions.add(position.id);
+            this.priceMonitor.pause();
+            this.executeStopLoss(position, 'trailing_stop')
+              .catch((err) => {
+                logger.error(`[positions] Momentum sell error: ${err}`);
+                const retries = (this.sellRetries.get(position.id) ?? 0) + 1;
+                this.sellRetries.set(position.id, retries);
+                this.sellRetryAfter.set(position.id, Date.now() + PositionManager.SELL_RETRY_BASE_DELAY_MS * Math.pow(2, retries - 1));
+              })
+              .finally(() => {
+                this.sellingPositions.delete(position.id);
+                this.priceMonitor.resume();
+              });
+            continue;
+          }
+        }
+      }
+
       // Check stop loss
       const slAction = evaluateStopLoss(
         position,
@@ -696,6 +728,20 @@ export class PositionManager {
     const result = await this.sellFn(position.tokenMint, sellAmount, position.poolAddress, position.source);
 
     if (result.success) {
+      // v11m: Zero-output guard — TX confirmed but swap returned 0 SOL (pool drained between sim and execution)
+      // Bug found: FtnWkqsa peaked 2.25x, 2 "successful" sells returned 0 SOL, PnL = -100%
+      // Don't count as real success if outputAmount is 0 — tokens are still in wallet, retry
+      if (result.outputAmount === 0) {
+        logger.warn(
+          `[positions] TP${level + 1} TX confirmed but outputAmount=0 for ${shortenAddress(position.tokenMint)} — pool likely drained, treating as failed sell`,
+        );
+        // Set cooldown and let normal retry logic handle it
+        this.tpSellCooldownUntil.set(position.id, Date.now() + PositionManager.TP_SELL_COOLDOWN_MS);
+        // Rollback level so it can be re-triggered
+        position.tpLevelsHit = position.tpLevelsHit.filter((l) => l !== level);
+        return;
+      }
+
       position.sellSuccesses++;
       // v9q: Use actual inputAmount from result (handles double-sell where both protocols sold)
       const actualSold = Math.min(result.inputAmount || sellAmount, position.tokenAmount);
@@ -910,6 +956,18 @@ export class PositionManager {
     }
 
     if (result.success) {
+      // v11m: Zero-output guard for stop-loss path too — same bug as TP path (FtnWkqsa)
+      // TX confirmed but swap returned 0 SOL = pool drained, tokens still in wallet
+      if (result.outputAmount === 0 && reason !== 'rug_pull') {
+        logger.warn(
+          `[positions] SL sell TX confirmed but outputAmount=0 for ${shortenAddress(position.tokenMint)} — treating as failed, will retry`,
+        );
+        const newRetries = (this.sellRetries.get(position.id) ?? 0) + 1;
+        this.sellRetries.set(position.id, newRetries);
+        this.sellRetryAfter.set(position.id, Date.now() + PositionManager.SELL_RETRY_BASE_DELAY_MS * Math.pow(2, newRetries - 1));
+        return;
+      }
+
       // v9j: Wrap ALL post-sell logic in try/catch — position MUST close even if logging fails
       // Data (v9i): sell TX confirmed on-chain but position stayed 'open' in memory,
       // blocking new trades for 3+ minutes until bot crashed

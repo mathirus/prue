@@ -24,6 +24,10 @@ interface MonitoredToken {
   lastSolReserve?: number;
   // v8r: Track previous poll's SOL reserve for inter-poll drain detection
   previousSolReserve?: number;
+  // v11m: Constant product K tracking — K = baseReserve * quoteReserve (BigInt for precision)
+  // Normal swaps increase K (fees). K decrease = liquidity removal.
+  initialK?: bigint;
+  previousK?: bigint;
   // Stale price detection: count consecutive fetch failures
   consecutiveFailures: number;
   rugPullDetected?: boolean;
@@ -53,6 +57,7 @@ export class PriceMonitor {
   private rugPullCallbacks: RugPullCallback[] = [];
   private authorityCallbacks: AuthorityCallback[] = [];
   private paused = false;
+  private pollPending = false; // v11k: pending guard — max 1 pollPrices in-flight
   // Max consecutive failures before we stop returning stale prices
   private static readonly MAX_STALE_READS = 3;
   // v9f: Exponential backoff for 429s on vault caching
@@ -155,36 +160,46 @@ export class PriceMonitor {
 
   private async pollPrices(): Promise<void> {
     if (this.paused) return;
+    // v11k: Pending guard — skip if previous poll still in-flight
+    if (this.pollPending) {
+      logger.debug('[price] pollPrices skipped (previous pending)');
+      return;
+    }
     const tokens = [...this.monitoredTokens.values()];
     if (tokens.length === 0) return;
 
-    // Separate PumpSwap (batch via reserves) from others (Jupiter API)
-    const pumpswap: MonitoredToken[] = [];
-    const others: MonitoredToken[] = [];
+    this.pollPending = true;
+    try {
+      // Separate PumpSwap (batch via reserves) from others (Jupiter API)
+      const pumpswap: MonitoredToken[] = [];
+      const others: MonitoredToken[] = [];
 
-    for (const t of tokens) {
-      if (this.connection && t.poolAddress && t.source === 'pumpswap' && !t.rugPullDetected) {
-        pumpswap.push(t);
-      } else if (!t.rugPullDetected) {
-        others.push(t);
+      for (const t of tokens) {
+        if (this.connection && t.poolAddress && t.source === 'pumpswap' && !t.rugPullDetected) {
+          pumpswap.push(t);
+        } else if (!t.rugPullDetected) {
+          others.push(t);
+        }
       }
-    }
 
-    // Batch ALL PumpSwap vault queries into 1-2 RPC calls (was N calls before)
-    if (pumpswap.length > 0) {
-      await this.batchFetchPumpSwapPrices(pumpswap);
-    }
-
-    // Non-PumpSwap tokens: use Jupiter sequentially
-    for (const t of others) {
-      const price = await this.fetchJupiterPrice(t.mint);
-      if (price !== null) {
-        t.consecutiveFailures = 0;
-        this.emitPrice(t, price);
-      } else {
-        t.consecutiveFailures++;
-        this.emitPrice(t, null);
+      // Batch ALL PumpSwap vault queries into 1-2 RPC calls (was N calls before)
+      if (pumpswap.length > 0) {
+        await this.batchFetchPumpSwapPrices(pumpswap);
       }
+
+      // Non-PumpSwap tokens: use Jupiter sequentially
+      for (const t of others) {
+        const price = await this.fetchJupiterPrice(t.mint);
+        if (price !== null) {
+          t.consecutiveFailures = 0;
+          this.emitPrice(t, price);
+        } else {
+          t.consecutiveFailures++;
+          this.emitPrice(t, null);
+        }
+      }
+    } finally {
+      this.pollPending = false;
     }
   }
 
@@ -288,6 +303,10 @@ export class PriceMonitor {
         // Anti-rug: track SOL reserves for drain detection
         this.checkReserveDrain(token, solReserve);
 
+        // v11m: Track constant product K = base * quote (BigInt to avoid overflow)
+        // Normal swaps: K stays same or increases (fees). K decrease = liquidity removal.
+        this.checkKDrain(token, baseInfo.data.readBigUInt64LE(64), quoteInfo.data.readBigUInt64LE(64));
+
         // v8r: Periodic authority check (~every 30s = 20 polls at 1.5s)
         token.pollCount++;
         if (token.pollCount % 20 === 0 && token.mintAddress && this.connection) {
@@ -357,6 +376,51 @@ export class PriceMonitor {
         cb(key, token.lastPrice);
       }
     }
+  }
+
+  // v11m: K drop threshold — 3% decrease in constant product = liquidity removal
+  // Normal trading only INCREASES K (swap fees), so any decrease is suspicious.
+  // 3% threshold avoids false positives from rounding/precision.
+  private static readonly K_DROP_PCT = 3;
+
+  /**
+   * v11m: Track constant product K = baseReserve * quoteReserve.
+   * In AMM: swaps keep K constant (or increase via fees). K decrease = liquidity removed.
+   * More precise than SOL-only reserve tracking because it catches removals where
+   * both reserves change proportionally (single-side tracking misses these).
+   */
+  private checkKDrain(token: MonitoredToken, baseReserveBig: bigint, quoteReserveBig: bigint): void {
+    if (token.rugPullDetected) return;
+    const currentK = baseReserveBig * quoteReserveBig;
+    if (currentK === 0n) return;
+
+    if (token.initialK === undefined) {
+      token.initialK = currentK;
+      token.previousK = currentK;
+      return;
+    }
+
+    // Check K drop from initial
+    if (token.initialK > 0n) {
+      // Use integer math: dropPct = (initial - current) * 100 / initial
+      const dropBps = (token.initialK - currentK) * 10000n / token.initialK;
+      const dropPct = Number(dropBps) / 100;
+
+      if (dropPct >= PriceMonitor.K_DROP_PCT) {
+        const key = token.mint.toBase58();
+        logger.warn(
+          `[price] 🚨 K-DROP: ${key.slice(0, 8)}... constant product dropped ${dropPct.toFixed(1)}% — liquidity removed`,
+        );
+        // Trigger rug detection via same callbacks as reserve drain
+        token.rugPullDetected = true;
+        for (const cb of this.rugPullCallbacks) {
+          cb(key, dropPct);
+        }
+        this.deactivateFastPoll();
+      }
+    }
+
+    token.previousK = currentK;
   }
 
   /** Track SOL reserves and detect rug pull (>15% drain or >50% inter-poll drop) */

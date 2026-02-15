@@ -14,7 +14,7 @@ analysis:
   # Minimum security score
   # v11a: Testing at 65 (was 60). Will raise to 70 for live.
   # Score 65+: ~1 every 3min, 29% of pools. Score 70+: ~1 every 6min, 15% of pools.
-  min_score: 65
+  min_score: 73
   # Weights for scoring
   weights:
     freeze_authority: 15   # v9A: was 20. Scammers revoke freeze to gain points, reduced discriminative value
@@ -93,11 +93,13 @@ position:
   # v11k: Added TP2@2.0x sell 50% of remaining (10% of original)
   # Data: 7JAV peaked at 2.189x for 23s, no TP2 → pool rugged → moon bag lost
   # TP2 would have locked in profit on half the moon bag before the rug
+  # v11m: Sell 100% at TP1 while position size = 0.001 SOL
+  # Math: moonbag (20% of 0.001 = 0.0002 SOL) costs more in sell fees (0.0004) than it's worth
+  # Moonbag PnL: 5 rugged (-0.0035 SOL) vs 3 trailing wins (+0.0021) = net -0.0014 SOL
+  # Re-enable moonbag (80%/50%) when position size >= 0.005 SOL
   take_profit:
-    - pct: 80
+    - pct: 100
       at_multiplier: 1.08
-    - pct: 50
-      at_multiplier: 2.0
   # Stop loss: -30% (same - working well)
   stop_loss_pct: -30
   # v9d: Trailing stop 10% (was 25%). Data: N=47 shadow, +3.16% exit improvement, 45% benefit, 0% worsen
@@ -128,7 +130,7 @@ risk:
   # Will raise to 0.05 when balance >= 0.25 SOL
   # v11a: Testing phase — 0.001 SOL/trade (minimum). Every trade loses to fees.
   # Goal: verify paid tier works (0 errors, sells execute). Scale after 5 clean trades.
-  max_position_sol: 0.005
+  max_position_sol: 0.001
   # v9v: max_concurrent=1 for overnight stability. Only 1 trade at a time = no RPC contention.
   max_concurrent: 1
   # Max trades per session (0 = unlimited)

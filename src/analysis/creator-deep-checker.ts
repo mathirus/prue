@@ -20,6 +20,9 @@ export interface CreatorDeepProfile {
   solBalance: number;
   isLowBalance: boolean;
 
+  // v11m: Serial deployer detection
+  recentTxCount24h: number;
+
   // Score for TokenScorer
   reputationScore: number;
   reputationReason: string;
@@ -79,6 +82,20 @@ async function traceFundingSource(
 }
 
 /**
+ * v11m: Serial deployer detection — check if creator has deployed many tokens recently.
+ * Uses the creator's TX signatures (already fetched) to count recent activity.
+ * Serial deployers launching 5+ tokens/day are almost always scammers.
+ * Returns the count of transactions in the last 24h.
+ */
+function countRecentActivity(
+  sigs: Array<{ signature: string; blockTime?: number | null }>,
+  lookbackSeconds: number = 86400,
+): number {
+  const cutoff = Math.floor(Date.now() / 1000) - lookbackSeconds;
+  return sigs.filter(s => s.blockTime && s.blockTime > cutoff).length;
+}
+
+/**
  * Compute reputation score based on creator profile.
  * Range: -20 to +10
  */
@@ -91,9 +108,27 @@ function computeReputationScore(
     return { score: -20, reason: 'scammer_network' };
   }
 
-  // Penalty: Funder has 3+ creators that rugged
-  if (profile.fundingNetworkSize >= 3) {
+  // v11m: Serial deployer penalty — creator has many recent TXs (likely deploying multiple tokens)
+  // Data: scammers deploy 10+ tokens/day. With sig limit=10, if all 10 are in last 24h,
+  // the wallet is hyper-active. 8+ recent TXs = heavy penalty, 6+ = moderate
+  if (profile.recentTxCount24h >= 8) {
+    return { score: -15, reason: `serial_deployer_${profile.recentTxCount24h}tx_24h` };
+  }
+  if (profile.recentTxCount24h >= 6) {
+    return { score: -10, reason: `active_deployer_${profile.recentTxCount24h}tx_24h` };
+  }
+
+  // Penalty: Funder has 2+ creators that rugged
+  if (profile.fundingNetworkSize >= 2) {
     return { score: -15, reason: `funder_${profile.fundingNetworkSize}_creators` };
+  }
+
+  // v11l: Check if funder is also a token creator with rug history
+  if (profile.fundingSource) {
+    const funderHistory = creatorTracker.getCreatorHistory(profile.fundingSource);
+    if (funderHistory.rugs >= 1) {
+      return { score: -15, reason: `funder_rugged_${funderHistory.rugs}x` };
+    }
   }
 
   // Penalty: New wallet + low balance (throwaway deployer)
@@ -112,11 +147,6 @@ function computeReputationScore(
   if (profile.walletAgeSeconds < 86400 && profile.txCount < 3) {
     return { score: -5, reason: 'young_inactive_wallet' };
   }
-
-  // Bonus: Trusted creator (2+ winners, 0 rugs) - uses existing CreatorTracker
-  // Note: this check is done here to centralize reputation logic
-  // The caller passes the creator address, we check via tracker
-  // Actually this is handled in the main pipeline already, so skip double-check
 
   // Bonus: Mature wallet with history
   if (profile.walletAgeSeconds > 30 * 86400 && profile.txCount >= 10) {
@@ -159,6 +189,7 @@ export async function getCreatorDeepProfile(
     isKnownScammerNetwork: false,
     solBalance: 0,
     isLowBalance: false,
+    recentTxCount24h: 0,
     reputationScore: 0,
     reputationReason: 'error_fallback',
   };
@@ -180,6 +211,7 @@ export async function getCreatorDeepProfile(
         isNewWallet: true,
         solBalance: 0,
         isLowBalance: true,
+        recentTxCount24h: 0,
         reputationScore: -10,
         reputationReason: 'brand_new_wallet',
       };
@@ -209,8 +241,8 @@ export async function getCreatorDeepProfile(
       const networkCreators = creatorTracker.getCreatorsByFundingSource(fundingSource);
       fundingNetworkSize = networkCreators.length;
 
-      // Auto-promote to blacklist if 3+ rug creators from same funder
-      if (fundingNetworkSize >= 3) {
+      // Auto-promote to blacklist if 2+ rug creators from same funder
+      if (fundingNetworkSize >= 2) {
         blacklist.checkAndAutoPromote(fundingSource, creatorTracker);
       }
 
@@ -232,7 +264,7 @@ export async function getCreatorDeepProfile(
           // Check if hop2 funds many creators
           if (fundingSourceHop2 && !isKnownScammerNetwork) {
             const hop2Creators = creatorTracker.getCreatorsByFundingSource(fundingSourceHop2);
-            if (hop2Creators.length >= 3) {
+            if (hop2Creators.length >= 2) {
               blacklist.checkAndAutoPromote(fundingSourceHop2, creatorTracker);
               isKnownScammerNetwork = true;
             }
@@ -258,7 +290,7 @@ export async function getCreatorDeepProfile(
               isKnownScammerNetwork = true;
             } else {
               const hop3Creators = creatorTracker.getCreatorsByFundingSource(fundingSourceHop3);
-              if (hop3Creators.length >= 3) {
+              if (hop3Creators.length >= 2) {
                 blacklist.checkAndAutoPromote(fundingSourceHop3, creatorTracker);
                 isKnownScammerNetwork = true;
               }
@@ -270,6 +302,9 @@ export async function getCreatorDeepProfile(
       }
     }
 
+    // v11m: Count recent activity for serial deployer detection (zero-cost — uses existing sigs)
+    const recentTxCount24h = countRecentActivity(sigs);
+
     const partialProfile = {
       walletAgeSeconds,
       txCount,
@@ -280,6 +315,7 @@ export async function getCreatorDeepProfile(
       isKnownScammerNetwork,
       solBalance,
       isLowBalance,
+      recentTxCount24h,
     };
 
     const { score, reason } = computeReputationScore(partialProfile, creatorTracker);
@@ -297,7 +333,7 @@ export async function getCreatorDeepProfile(
         : `${walletAgeSeconds}s`;
 
     logger.info(
-      `[creator-deep] ${creatorAddress.slice(0, 8)}... age=${ageStr} txs=${txCount}${txCount >= 10 ? '+' : ''} bal=${solBalance.toFixed(3)} funder=${fundingSource?.slice(0, 8) ?? 'N/A'} network=${fundingNetworkSize} rep=${score}(${reason})`,
+      `[creator-deep] ${creatorAddress.slice(0, 8)}... age=${ageStr} txs=${txCount}${txCount >= 10 ? '+' : ''} recent24h=${recentTxCount24h} bal=${solBalance.toFixed(3)} funder=${fundingSource?.slice(0, 8) ?? 'N/A'} network=${fundingNetworkSize} rep=${score}(${reason})`,
     );
 
     // v9x: Cache successful profiles

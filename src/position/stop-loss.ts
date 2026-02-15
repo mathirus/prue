@@ -34,13 +34,14 @@ export function evaluateStopLoss(
     };
   }
 
-  // v11i: Moonbag breakeven floor — protect TP1 gains by selling if price drops below entry
-  // Data: 80/20 split means moonbag is 20% of position. If it goes below entry, we're losing
-  // the TP1 gains. Sell to lock in profit from the 80% sold at TP1.
+  // v11m: Moonbag profit floor — protect TP1 gains by selling if price drops below 1.03x
+  // Data (v11i): 5 trades hit TP1 then moonbag rugged → -13.6% each (consistent)
+  // At 1.0x floor, we lose all TP1 gains before triggering. At 1.03x, we lock in some profit.
+  // v11i origin: 80/20 split, now at 100% sell so this only activates with future moonbag re-enable
   if (position.status === 'partial_close' && position.tpLevelsHit.length >= 1) {
     const currentMultiple = position.entryPrice > 0 ? position.currentPrice / position.entryPrice : 0;
-    if (currentMultiple > 0 && currentMultiple < 1.0) {
-      logger.info(`[sl] MOONBAG BREAKEVEN triggered: ${currentMultiple.toFixed(2)}x < 1.0x (protecting TP gains)`);
+    if (currentMultiple > 0 && currentMultiple < 1.03) {
+      logger.info(`[sl] MOONBAG FLOOR triggered: ${currentMultiple.toFixed(2)}x < 1.03x (protecting TP gains)`);
       return {
         shouldSell: true,
         reason: 'trailing_stop',

@@ -420,6 +420,31 @@ Estos son descubrimientos validados con datos reales que guían todas las decisi
 - **Fix**: Patrón getter function: `getConnection: () => Connection` en lugar de almacenar referencia directa
 - **Leccion**: Cualquier módulo que almacene una Connection debe usar getter function para sobrevivir resets.
 
+### 10. Background Task Request Flooding & Pending Guards (v11k)
+- **Problema**: Cuando Helius se pone lento (9s+ por request), las tareas de background inundan el pool de conexiones undici. Cache warming (1s), blockhash cache (1s), balance cache (15s), price monitor (1.5s) todos disparan sin verificar si la llamada anterior completó. Con Helius en 9s, cache warming apila 9+ getSlot requests por sí solo. Con 3+ tareas, son 20+ requests de background → el pool de 50 conexiones se satura → requests reales (análisis, compra, venta) timeout.
+- **Evidencia**: curl=173ms, Node fresco=670ms, bot=10-12s timeout. 0 errores 429. El bot se ahogaba a sí mismo.
+- **Solución**:
+  - **Pending guards**: Cada tarea de background tiene un flag `pending`. Si la llamada anterior no completó, skip. Max 1 request in-flight por tarea (era 9+ durante slowdown).
+  - **Backpressure global**: `rpcManager.isUnderPressure` (true si inflight > 15). Background tasks skip cuando hay backpressure, liberando el pool para requests reales.
+  - **Health check timeout 5s→9s**: Con 5s timeout y Helius en 9s, el health check SIEMPRE fallaba → connection reset cascade innecesaria.
+  - **Diagnósticos**: Inflight stats cada 30s, event loop lag monitor cada 2s, logs en pending guards/backpressure.
+- **Resultado**: Max background inflight = 6 (1 warming + 1 blockhash + 1 balance + 2 health + 1 price) en vez de 20+. CERO FETCH TIMEOUTs post-fix vs cascading timeouts pre-fix.
+- **Leccion**: Las tareas de background con intervalos fijos DEBEN tener pending guards. Sin ellos, un slowdown temporal se convierte en una falla total porque las requests se apilan exponencialmente.
+- **Archivos**: `rpc-manager.ts` (pending guard warming, backpressure getters, diagnostics), `blockhash-cache.ts` (pending guard, shouldSkip), `balance-cache.ts` (pending guard, shouldSkip), `price-monitor.ts` (pending guard), `index.ts` (wire shouldSkip callbacks).
+
+### 11. WebSocket Message Flooding — O(n) Cleanup en Hot Path (v11k)
+- **Problema**: Bot usaba 90% CPU con event loop lags de 2-3 segundos. Todos los RPC calls hacían timeout artificialmente porque los callbacks no podían correr. curl=175ms, Node fresco=14ms, bot=9-11s.
+- **Root cause**: PumpSwap genera **~450 mensajes WebSocket/segundo** (cada swap en cualquier pool PumpSwap). El callback del PumpSwap monitor tenía un cleanup O(n) que iteraba ~2000 entries del Map de dedup **en cada callback**. A 450 msgs/s × 2 maps × 2000 entries = **1.8M operaciones/segundo** desperdiciadas solo en cleanup. Pool-detector y PumpFun-monitor tenían el mismo pattern (`Array.from(Set) + new Set(slice)`). Pool-detector además hacía `logs.join(' ')` creando un string enorme en cada callback.
+- **Evidencia**: MSG RATE diagnostic (nuevo) muestra ~500 msgs/s total. CPU escalaba: 12%→33%→59%→73%→90% en 3.5 minutos. Al 90%, el bot ya no podía procesar los 500 msgs/s y el WS rate visible caía a 127/s (cola acumulada).
+- **Solución**:
+  - **PumpSwap**: Mover cleanup de Map a `setInterval` cada 60s (era en cada callback)
+  - **Pool-detector**: Cambiar `Array.from + new Set(slice)` por `Set.clear()` cuando > 5000 (pool creates son raros)
+  - **PumpFun**: Mismo fix que pool-detector
+  - **Pool-detector**: Reemplazar `logs.join(' ')` por `logs.some()` (evita crear string gigante)
+  - **WS diagnostic**: Agregar contador de mensajes por suscripción logueado cada 10s
+- **Resultado**: CPU estable en **10-11%** (era 90%), CERO event loop lags (era 2-3s), CERO FETCH TIMEOUTs, TP1 sell en **3044ms** (era 16s+ timeout). MSG rate se mantiene a 400-500/s estable (antes colapsaba a 127/s).
+- **Leccion**: NUNCA poner operaciones O(n) en callbacks que corren cientos de veces por segundo. Los WS callbacks de programas Solana populares reciben 500+ msgs/s — todo lo que no sea O(1) se amplifica 500x.
+
 ---
 
 ## Reglas para Claude Code

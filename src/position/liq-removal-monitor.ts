@@ -35,6 +35,9 @@ export class LiquidityRemovalMonitor {
   // v8u: Sell burst detection — track sell count per pool in sliding window
   // Data: rugs show 10+ sells in <15s before price crashes. Normal trading = 1-3 sells/15s.
   private sellBurstTracker = new Map<string, number[]>(); // poolAddr → timestamps of recent sells
+  // v11m: Buy tracking for buy/sell ratio (rug prediction signal)
+  // Data: when sell ratio exceeds buys 2:1 for 30s+, momentum is dead → sell signal
+  private buyTracker = new Map<string, number[]>(); // poolAddr → timestamps of recent buys
   // v8u: Cumulative sell counter per pool (lifetime total, not windowed) for ML features
   private cumulativeSellCount = new Map<string, number>(); // poolAddr → total sells observed
   // v9f: Cooldown after burst trigger — prevent re-triggering for 30s
@@ -42,6 +45,8 @@ export class LiquidityRemovalMonitor {
   private static readonly BURST_WINDOW_MS = 15_000; // 15-second sliding window
   private static readonly BURST_THRESHOLD = 8; // 8+ sells = likely rug dump
   private static readonly BURST_COOLDOWN_MS = 30_000; // 30s cooldown after burst trigger
+  // v11m: Buy/sell ratio window for momentum detection
+  private static readonly RATIO_WINDOW_MS = 30_000; // 30-second window for ratio calculation
 
   private readonly getConnection: () => Connection;
   constructor(getConn: (() => Connection) | Connection) {
@@ -101,6 +106,19 @@ export class LiquidityRemovalMonitor {
               (line.includes('Instruction: Sell') || line.includes('Instruction: SellExactIn')) &&
               !line.includes('Buy'), // Make sure it's not a buy instruction
           );
+
+          // v11m: Detect buys for buy/sell ratio tracking
+          const isBuy = !isRemoveLiq && !isSuspiciousSell && logs.logs.some(
+            (line) =>
+              line.includes('Instruction: Buy') || line.includes('Instruction: BuyExactIn'),
+          );
+          if (isBuy) {
+            const buyTimestamps = this.buyTracker.get(poolStr) ?? [];
+            buyTimestamps.push(Date.now());
+            // Trim to ratio window
+            const buyCutoff = Date.now() - LiquidityRemovalMonitor.RATIO_WINDOW_MS;
+            this.buyTracker.set(poolStr, buyTimestamps.filter(t => t > buyCutoff));
+          }
 
           if (isRemoveLiq) {
             const mintStr = this.subscriptions.get(poolStr)?.mintStr ?? '';
@@ -193,6 +211,26 @@ export class LiquidityRemovalMonitor {
   }
 
   /**
+   * v11m: Get buy/sell ratio for a pool in the last 30 seconds.
+   * Returns { buys, sells, ratio } where ratio = sells / max(buys, 1).
+   * ratio > 2.0 = bearish (2x more sells than buys) → potential dump signal.
+   * ratio < 0.5 = bullish (2x more buys than sells) → healthy momentum.
+   */
+  getBuySellRatio(poolAddress: string): { buys: number; sells: number; ratio: number } {
+    const now = Date.now();
+    const cutoff = now - LiquidityRemovalMonitor.RATIO_WINDOW_MS;
+
+    const buyTimestamps = this.buyTracker.get(poolAddress) ?? [];
+    const sellTimestamps = this.sellBurstTracker.get(poolAddress) ?? [];
+
+    const recentBuys = buyTimestamps.filter(t => t > cutoff).length;
+    const recentSells = sellTimestamps.filter(t => t > cutoff).length;
+    const ratio = recentSells / Math.max(recentBuys, 1);
+
+    return { buys: recentBuys, sells: recentSells, ratio };
+  }
+
+  /**
    * Stop monitoring a pool.
    */
   unsubscribe(poolAddress: PublicKey): void {
@@ -207,6 +245,7 @@ export class LiquidityRemovalMonitor {
     }
     this.subscriptions.delete(poolStr);
     this.sellBurstTracker.delete(poolStr); // v8u: cleanup burst tracker
+    this.buyTracker.delete(poolStr); // v11m: cleanup buy tracker
     this.burstCooldownUntil.delete(poolStr); // v9f: cleanup cooldown
     // Note: cumulativeSellCount NOT deleted here — recordOutcome reads it after unsubscribe.
     // Cleaned up in stop() or naturally garbage collected when monitor is destroyed.
@@ -226,6 +265,7 @@ export class LiquidityRemovalMonitor {
     }
     this.subscriptions.clear();
     this.sellBurstTracker.clear(); // v8u: cleanup
+    this.buyTracker.clear(); // v11m: cleanup
     this.cumulativeSellCount.clear(); // v8u: cleanup
     this.burstCooldownUntil.clear(); // v9f: cleanup
     logger.debug('[liq-monitor] All subscriptions cleared');
