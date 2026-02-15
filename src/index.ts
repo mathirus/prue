@@ -126,7 +126,8 @@ import { scheduleMissedGainsCheck, backfillMissedGains } from './analysis/missed
 import { checkWashTrading, type WashTradingResult } from './analysis/wash-trading-detector.js';
 import { checkCoordinatedLaunch, type CoordinatedLaunchResult } from './analysis/coordinated-launch-detector.js';
 import { checkOrganicBuyers, type OrganicBuyerResult } from './analysis/organic-buyer-checker.js';
-import { checkSmartWallets, type SmartWalletResult } from './analysis/smart-wallet-checker.js';
+import { checkSmartWallets, type SmartWalletResult, reloadSmartWallets } from './analysis/smart-wallet-checker.js';
+import { refreshSmartWallets } from './utils/smart-wallet-updater.js';
 import { WSOL_MINT } from './constants.js';
 import { startBlockhashCache, stopBlockhashCache } from './utils/blockhash-cache.js';
 import { withAnalysisRetry, enterSellPriority, exitSellPriority, setAtCapacity } from './utils/analysis-rpc.js';
@@ -243,6 +244,15 @@ async function main(): Promise<void> {
   // v9A: AllenHark external blacklist (4,178+ known scammer wallets)
   const allenHarkBlacklist = new AllenHarkBlacklist();
   await allenHarkBlacklist.init();
+
+  // v11n: Auto-refresh smart wallet list in background (non-blocking)
+  // Runs if data/smart-wallets.json is >7 days old. Uses DexScreener + Helius.
+  refreshSmartWallets(rpcManager.connection).then(updated => {
+    if (updated) {
+      reloadSmartWallets(); // Force re-read the updated file into the checker's cache
+      logger.info('[bot] Smart wallet list refreshed successfully');
+    }
+  }).catch(err => logger.debug(`[bot] Smart wallet refresh skipped: ${String(err).slice(0, 80)}`));
 
   // v9g: Shadow data collection runs ALWAYS (even in live mode) for ML training
   // LiqRemovalMonitor disabled — WebSocket traffic saturates Helius free tier

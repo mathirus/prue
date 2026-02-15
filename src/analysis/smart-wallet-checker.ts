@@ -47,6 +47,11 @@ const EMPTY_RESULT: SmartWalletResult = {
 // Module-level cache for smart wallet list (loaded once on first call)
 let smartWallets: SmartWallet[] | null = null;
 
+/** Force reload smart wallets from disk (called after auto-refresh updates the file). */
+export function reloadSmartWallets(): void {
+  smartWallets = null; // Clear cache so next loadSmartWallets() re-reads the file
+}
+
 /**
  * Load smart wallets from data/smart-wallets.json.
  * Cached in memory after first load.
