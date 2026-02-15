@@ -25,6 +25,9 @@ export class WebSocketManager {
   // v11g: Per-subscription stale detection (was global — Raydium callbacks masked dead PumpSwap)
   // 90s without callbacks on a SPECIFIC subscription = stale for that subscription
   private static readonly STALE_TIMEOUT_MS = 90 * 1000;
+  // v11k DIAGNOSTIC: WS message rate counter per subscription
+  private wsMsgCounts = new Map<string, number>();
+  private wsMsgInterval?: ReturnType<typeof setInterval>;
 
   private readonly getConnection: () => Connection;
   constructor(
@@ -79,6 +82,19 @@ export class WebSocketManager {
   }
 
   startHeartbeat(intervalMs = 30_000): void {
+    // v11k DIAGNOSTIC: Log WS message rate every 10s
+    this.wsMsgInterval = setInterval(() => {
+      const parts: string[] = [];
+      for (const [id, count] of this.wsMsgCounts) {
+        parts.push(`${id}=${count}`);
+      }
+      if (parts.length > 0) {
+        const total = [...this.wsMsgCounts.values()].reduce((a, b) => a + b, 0);
+        logger.info(`[ws] MSG RATE (10s): ${parts.join(', ')} | total=${total} (${(total / 10).toFixed(0)}/s)`);
+      }
+      this.wsMsgCounts.clear();
+    }, 10_000);
+
     this.heartbeatInterval = setInterval(async () => {
       const now = Date.now();
 
@@ -130,6 +146,9 @@ export class WebSocketManager {
     if (this.heartbeatInterval) {
       clearInterval(this.heartbeatInterval);
     }
+    if (this.wsMsgInterval) {
+      clearInterval(this.wsMsgInterval);
+    }
   }
 
   private async attachSubscription(sub: Subscription): Promise<void> {
@@ -139,6 +158,8 @@ export class WebSocketManager {
         (logs, ctx) => {
           // v11g: Update per-subscription activity timestamp
           sub.lastActivityTs = Date.now();
+          // v11k DIAGNOSTIC: count messages per subscription
+          this.wsMsgCounts.set(sub.id, (this.wsMsgCounts.get(sub.id) ?? 0) + 1);
           if (!this.isConnected) {
             this.isConnected = true;
             this.reconnectAttempts = 0;

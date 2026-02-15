@@ -56,7 +56,7 @@ export class ScammerBlacklist {
 
     try {
       const creators = creatorTracker.getCreatorsByFundingSource(fundingSource);
-      if (creators.length < 3) return false;
+      if (creators.length < 2) return false;
 
       // Count how many of those creators have rug outcomes
       let rugCount = 0;
@@ -65,7 +65,7 @@ export class ScammerBlacklist {
         if (history.rugs > 0) rugCount++;
       }
 
-      if (rugCount >= 3) {
+      if (rugCount >= 2) {
         this.addToBlacklist(fundingSource, `auto_promote: ${rugCount} rug creators funded`);
 
         // Update linked_rug_count

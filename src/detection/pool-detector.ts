@@ -52,22 +52,22 @@ export class PoolDetector {
     if (this.processedSignatures.has(signature)) return;
     this.processedSignatures.add(signature);
 
-    // Cleanup old signatures every 1000 entries
-    if (this.processedSignatures.size > 1000) {
-      const arr = Array.from(this.processedSignatures);
-      this.processedSignatures = new Set(arr.slice(-500));
+    // v11k: Lightweight cleanup — only when very large, and just clear entirely
+    // At 45 msgs/s, reaches 5000 in ~2 min. Pool creations are rare (~1/min),
+    // so clearing the whole set loses nothing meaningful.
+    if (this.processedSignatures.size > 5000) {
+      this.processedSignatures.clear();
     }
 
-    // Look for pool initialization patterns
-    // initialize2 is the explicit instruction, but also look for mint initialization
-    // which happens when a new pool is created
-    const logText = logs.join(' ');
-
-    const hasInit =
-      logText.includes('initialize2') ||
-      logText.includes('InitializeInstruction2') ||
+    // v11k: Use logs.some() instead of logs.join(' ') — avoids creating huge string on every callback (45 msgs/s)
+    const hasInit = logs.some(
+      (log) =>
+        log.includes('initialize2') ||
+        log.includes('InitializeInstruction2'),
+    ) || logs.some(
       // Pool creation also involves initializing the LP mint
-      (logText.includes('ray_log') && logText.includes('InitializeMint'));
+      (log) => log.includes('ray_log') && log.includes('InitializeMint'),
+    );
 
     if (!hasInit) return;
 

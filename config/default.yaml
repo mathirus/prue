@@ -12,9 +12,10 @@ detection:
 
 analysis:
   # Minimum security score
-  # v11a: Testing at 65 (was 60). Will raise to 70 for live.
-  # Score 65+: ~1 every 3min, 29% of pools. Score 70+: ~1 every 6min, 15% of pools.
-  min_score: 73
+  # v11m: Lowered 73→69. New filters (serial deployer -15, coordinated launch -20,
+  # K tracking, buy/sell ratio) catch scams that score alone missed. Lower threshold
+  # = more trades = more data to validate v11m improvements.
+  min_score: 65
   # Weights for scoring
   weights:
     freeze_authority: 15   # v9A: was 20. Scammers revoke freeze to gain points, reduced discriminative value

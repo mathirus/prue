@@ -61,10 +61,9 @@ export class PumpFunMonitor {
     if (this.processedSignatures.has(signature)) return;
     this.processedSignatures.add(signature);
 
-    // Cleanup old signatures every 1000 entries
-    if (this.processedSignatures.size > 1000) {
-      const arr = Array.from(this.processedSignatures);
-      this.processedSignatures = new Set(arr.slice(-500));
+    // v11k: Lightweight cleanup — clear entirely when large
+    if (this.processedSignatures.size > 5000) {
+      this.processedSignatures.clear();
     }
 
     // Migration logs typically contain references to migration or withdraw

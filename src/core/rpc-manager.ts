@@ -1,13 +1,13 @@
 import { Connection, type ConnectionConfig } from '@solana/web3.js';
+import { fetch as undiciFetch } from 'undici';
 import { logger } from '../utils/logger.js';
 import { RateLimiter } from '../utils/rate-limiter.js';
+import { isSellPriorityActive } from '../utils/analysis-rpc.js';
 
-// v11k: Replaced agentkeepalive + node-fetch with globalThis.fetch (undici).
-// Root cause: agentkeepalive creates socket storms (69 sockets for 6 requests)
-// during Helius blips, blocking the event loop and making the bot unable to sell.
-// curl works fine (188ms) while node-fetch+agent times out at 9-12s.
-// undici (built into Node.js 18+) manages its own connection pool robustly.
-// No custom socket management = no socket pool poisoning.
+// v11k fix: On Node.js 18, globalThis.fetch uses an INTERNAL undici copy with unlimited connections.
+// setGlobalDispatcher() from the npm undici package does NOT affect globalThis.fetch on Node 18.
+// So we import fetch directly from the npm undici package, which IS affected by setGlobalDispatcher().
+// This gives us the connection limit of 50 set in index.ts.
 
 interface RpcEndpoint {
   url: string;
@@ -28,6 +28,10 @@ export class RpcManager {
   private readonly baseConnConfig: Omit<ConnectionConfig, 'httpAgent' | 'fetch'>;
   private connectionResetCallbacks: Array<() => void> = [];
   private isChecking = false;
+  private inflight = 0; // diagnostic: concurrent requests in-flight
+  private cacheWarmPending = false; // v11k: pending guard — max 1 getSlot in-flight
+  private diagnosticInterval?: ReturnType<typeof setInterval>;
+  private eventLoopInterval?: ReturnType<typeof setInterval>;
 
   constructor(
     urls: string[],
@@ -56,32 +60,45 @@ export class RpcManager {
     }
   }
 
-  // v11k: Simple fetch wrapper with AbortController timeout.
-  // globalThis.fetch (undici) manages its own connection pool with proper keep-alive.
-  // No agentkeepalive = no socket storms = no event loop blocking.
+  // v11k fix: Use undiciFetch (npm package) NOT globalThis.fetch.
+  // On Node 18, globalThis.fetch uses internal undici with unlimited connections.
+  // npm undici's fetch respects setGlobalDispatcher({connections: 50}) from index.ts.
   private createFetchWithTimeout() {
     const FETCH_TIMEOUT_MS = 9_000;
+    const self = this;
     return async (url: string | URL, init?: Record<string, unknown>): Promise<Response> => {
+      // Extract RPC method from body for diagnostics
+      let method = '?';
+      try {
+        const body = (init as Record<string, unknown>)?.body;
+        if (typeof body === 'string') {
+          const parsed = JSON.parse(body);
+          method = parsed.method || '?';
+        }
+      } catch { /* ignore */ }
+
+      self.inflight++;
       const controller = new AbortController();
       const start = Date.now();
       const timer = setTimeout(() => {
         const elapsed = Date.now() - start;
-        logger.warn(`[rpc] FETCH TIMEOUT (${elapsed}ms): ${String(url).substring(0, 60)}...`);
+        logger.warn(`[rpc] FETCH TIMEOUT (${elapsed}ms) method=${method} inflight=${self.inflight}`);
         controller.abort();
       }, FETCH_TIMEOUT_MS);
       try {
-        const response = await globalThis.fetch(String(url), {
+        const response = await undiciFetch(String(url), {
           ...init as RequestInit,
           signal: controller.signal,
         });
-        return response;
+        return response as unknown as Response;
       } finally {
+        self.inflight--;
         clearTimeout(timer);
       }
     };
   }
 
-  // v11k: Connection with globalThis.fetch + timeout wrapper
+  // v11k: Connection with undici fetch + timeout wrapper
   private createConnection(url: string): Connection {
     return new Connection(url, {
       ...this.baseConnConfig,
@@ -93,6 +110,15 @@ export class RpcManager {
   // v11j: Register callback for connection reset events
   onConnectionReset(callback: () => void): void {
     this.connectionResetCallbacks.push(callback);
+  }
+
+  // v11k: Backpressure — lets background tasks check if RPC pool is saturated
+  get inflightCount(): number {
+    return this.inflight;
+  }
+
+  get isUnderPressure(): boolean {
+    return this.inflight > 15;
   }
 
   get connection(): Connection {
@@ -125,6 +151,8 @@ export class RpcManager {
     this.healthCheckInterval = setInterval(() => this.checkHealth(), intervalMs);
     this.checkHealth();
     this.startCacheWarming();
+    this.startDiagnostics();
+    this.startEventLoopMonitor();
   }
 
   stopHealthChecks(): void {
@@ -132,13 +160,35 @@ export class RpcManager {
       clearInterval(this.healthCheckInterval);
     }
     this.stopCacheWarming();
+    if (this.diagnosticInterval) {
+      clearInterval(this.diagnosticInterval);
+      this.diagnosticInterval = undefined;
+    }
+    if (this.eventLoopInterval) {
+      clearInterval(this.eventLoopInterval);
+      this.eventLoopInterval = undefined;
+    }
   }
 
   // v11g: Cache warming — keep connections alive + Gatekeeper regional cache hot
+  // v11k: Skips during sell priority to free Helius bandwidth for sell RPC calls
+  // v11k: Pending guard + backpressure — max 1 getSlot in-flight, skip if pool saturated
   private startCacheWarming(): void {
     if (this.cacheWarmingInterval) return;
     this.cacheWarmingInterval = setInterval(() => {
-      this.endpoints[0].connection.getSlot('processed').catch(() => {});
+      if (isSellPriorityActive()) return; // v11k: Don't waste Helius bandwidth during sell
+      if (this.cacheWarmPending) {
+        logger.debug('[rpc] cache warm skipped (previous pending)');
+        return;
+      }
+      if (this.isUnderPressure) {
+        logger.warn(`[rpc] cache warm skipped (RPC backpressure, inflight=${this.inflight})`);
+        return;
+      }
+      this.cacheWarmPending = true;
+      this.endpoints[0].connection.getSlot('processed').catch(() => {}).finally(() => {
+        this.cacheWarmPending = false;
+      });
     }, 1_000);
     logger.info('[rpc] Cache warming started (getSlot every 1s)');
   }
@@ -152,6 +202,11 @@ export class RpcManager {
   }
 
   private async checkHealth(): Promise<void> {
+    // v11k: Skip health checks during sell priority — free Helius bandwidth for sell
+    if (isSellPriorityActive()) {
+      logger.debug('[rpc] Health check skipped (sell priority active)');
+      return;
+    }
     if (this.isChecking) {
       logger.debug('[rpc] Health check skipped (previous still running)');
       return;
@@ -165,7 +220,7 @@ export class RpcManager {
           await Promise.race([
             ep.connection.getSlot(),
             new Promise<never>((_, reject) =>
-              setTimeout(() => reject(new Error('health check timeout')), 5_000),
+              setTimeout(() => reject(new Error('health check timeout')), 9_000),
             ),
           ]);
           ep.latencyMs = Date.now() - start;
@@ -201,7 +256,7 @@ export class RpcManager {
     }
   }
 
-  // v11k: Simplified reset — just create fresh Connection (no agent to destroy)
+  // v11k: Simplified reset — create fresh Connection (undici pool handles socket lifecycle)
   private resetEndpointConnection(ep: RpcEndpoint): void {
     const hostname = new URL(ep.url).hostname;
     logger.warn(
@@ -217,6 +272,32 @@ export class RpcManager {
     for (const cb of this.connectionResetCallbacks) {
       try { cb(); } catch (err) { logger.error('[rpc] Connection reset callback error:', err); }
     }
+  }
+
+  // v11k: Periodic inflight stats — detect backpressure buildup early
+  private startDiagnostics(): void {
+    this.diagnosticInterval = setInterval(() => {
+      if (this.inflight > 5) {
+        logger.warn(`[rpc] BACKPRESSURE: ${this.inflight} requests in-flight`);
+      } else {
+        logger.debug(`[rpc] inflight=${this.inflight}`);
+      }
+    }, 30_000);
+    this.diagnosticInterval.unref();
+  }
+
+  // v11k: Event loop lag monitor — early warning of thread starvation
+  private startEventLoopMonitor(): void {
+    let lastTick = Date.now();
+    this.eventLoopInterval = setInterval(() => {
+      const now = Date.now();
+      const lag = now - lastTick - 2_000; // expected interval is 2000ms
+      if (lag > 500) {
+        logger.warn(`[perf] Event loop lag: ${lag}ms`);
+      }
+      lastTick = now;
+    }, 2_000);
+    this.eventLoopInterval.unref();
   }
 
   getStatus(): Array<{ url: string; healthy: boolean; latencyMs: number }> {

@@ -1,5 +1,6 @@
 import { Connection, PublicKey } from '@solana/web3.js';
 import { logger } from './logger.js';
+import { isSellPriorityActive } from './analysis-rpc.js';
 
 /**
  * v11a: Simplified for Helius paid tier.
@@ -13,6 +14,7 @@ import { logger } from './logger.js';
 let cachedBalanceLamports: number | null = null;
 let lastUpdate = 0;
 let updateInterval: ReturnType<typeof setInterval> | null = null;
+let updatePending = false; // v11k: pending guard — max 1 getBalance in-flight
 
 export function getCachedBalanceLamports(): number | null {
   return cachedBalanceLamports;
@@ -31,8 +33,22 @@ export function startBalanceUpdater(
   walletPubkey: PublicKey,
   getConnection: () => Connection,
   intervalMs: number = 15_000,
+  shouldSkip?: () => boolean,
 ): void {
   const update = async () => {
+    // v11k: Skip refresh during sell priority — free Helius bandwidth for sell RPC calls
+    if (isSellPriorityActive()) return;
+    // v11k: Pending guard — skip if previous getBalance still in-flight
+    if (updatePending) {
+      logger.debug('[balance-cache] skipped (previous pending)');
+      return;
+    }
+    // v11k: Backpressure — skip if RPC pool is saturated
+    if (shouldSkip?.()) {
+      logger.warn('[balance-cache] skipped (RPC backpressure)');
+      return;
+    }
+    updatePending = true;
     try {
       const conn = getConnection();
       const lamports = await Promise.race([
@@ -45,6 +61,8 @@ export function startBalanceUpdater(
       lastUpdate = Date.now();
     } catch {
       // Keep stale cache, don't crash
+    } finally {
+      updatePending = false;
     }
   };
 

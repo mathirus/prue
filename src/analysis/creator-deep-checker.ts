@@ -108,15 +108,11 @@ function computeReputationScore(
     return { score: -20, reason: 'scammer_network' };
   }
 
-  // v11m: Serial deployer penalty — creator has many recent TXs (likely deploying multiple tokens)
-  // Data: scammers deploy 10+ tokens/day. With sig limit=10, if all 10 are in last 24h,
-  // the wallet is hyper-active. 8+ recent TXs = heavy penalty, 6+ = moderate
-  if (profile.recentTxCount24h >= 8) {
-    return { score: -15, reason: `serial_deployer_${profile.recentTxCount24h}tx_24h` };
-  }
-  if (profile.recentTxCount24h >= 6) {
-    return { score: -10, reason: `active_deployer_${profile.recentTxCount24h}tx_24h` };
-  }
+  // v11m: Serial deployer DISABLED — getSignaturesForAddress(limit:10) returns ALL tx types,
+  // not just token deployments. A single PumpFun launch creates 8-10 TXs (funding, create,
+  // bonding curve, buys). Result: 7/7 historical winners had txCount=10 → all false positives.
+  // TODO: To properly detect serial deployers, need to filter for PumpFun create instructions
+  // specifically, which requires parsing each TX (expensive). Disabled until redesigned.
 
   // Penalty: Funder has 2+ creators that rugged
   if (profile.fundingNetworkSize >= 2) {

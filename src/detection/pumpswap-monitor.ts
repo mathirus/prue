@@ -26,6 +26,7 @@ export class PumpSwapMonitor {
   private activeFetches = 0;
   private static readonly MAX_CONCURRENT_FETCHES = 2;
   private fetchQueue: Array<{ signature: string; slot: number; resolve: () => void }> = [];
+  private cleanupInterval?: ReturnType<typeof setInterval>;
 
   constructor(
     private readonly getConnection: () => Connection,
@@ -45,10 +46,10 @@ export class PumpSwapMonitor {
         if (logs.err) return;
         // ULTRA-DEDUP: Check at the very first point of entry
         const sig = String(logs.signature); // Force string coercion
-        const now = Date.now();
         if (this.recentSignatures.has(sig)) {
           // v9m: Silent counter instead of per-event warn (3815 warnings in v9l)
           this.dedupCount++;
+          const now = Date.now();
           if (now - this.lastDedupLog > 60_000 && this.dedupCount > 0) {
             logger.info(`[pumpswap] DEDUP: ${this.dedupCount} duplicates filtered in last 60s`);
             this.dedupCount = 0;
@@ -56,54 +57,52 @@ export class PumpSwapMonitor {
           }
           return;
         }
-        this.recentSignatures.set(sig, now);
-        // v9f: Time-based cleanup (remove entries older than 30 min) every 2000 entries
-        if (this.recentSignatures.size > 2000) {
-          const cutoff = now - PumpSwapMonitor.DEDUP_RETENTION_MS;
-          for (const [s, ts] of this.recentSignatures) {
-            if (ts < cutoff) this.recentSignatures.delete(s);
-          }
-        }
+        this.recentSignatures.set(sig, Date.now());
+        // v11k: Cleanup moved to periodic interval (was O(n) on every callback at 450 msgs/s)
         this.processLogs(sig, logs.logs, ctx.slot);
       },
     );
+
+    // v11k: Periodic cleanup every 60s instead of on every callback
+    // At 450 msgs/s, doing O(2000) cleanup on each msg = 900K ops/s → 90% CPU
+    this.cleanupInterval = setInterval(() => {
+      const cutoff = Date.now() - PumpSwapMonitor.DEDUP_RETENTION_MS;
+      if (this.recentSignatures.size > 1000) {
+        for (const [s, ts] of this.recentSignatures) {
+          if (ts < cutoff) this.recentSignatures.delete(s);
+        }
+      }
+      if (this.processedSignatures.size > 1000) {
+        for (const [sig, ts] of this.processedSignatures) {
+          if (ts < cutoff) this.processedSignatures.delete(sig);
+        }
+      }
+    }, 60_000);
 
     logger.info('[pumpswap] Listening for new PumpSwap pools');
   }
 
   async stop(): Promise<void> {
     this.isRunning = false;
+    if (this.cleanupInterval) {
+      clearInterval(this.cleanupInterval);
+      this.cleanupInterval = undefined;
+    }
     await this.wsManager.unsubscribe('pumpswap-pools');
     logger.info('[pumpswap] Stopped');
   }
 
   private processLogs(signature: string, logs: string[], slot: number): void {
     // Early dedup: skip if we already processed this signature
-    if (this.processedSignatures.has(signature)) {
-      // Only log for CreatePool (not every swap)
-      const hasCreate = logs.some((l) => l.includes('CreatePool') || l.includes('create_pool'));
-      if (hasCreate) {
-        logger.warn(`[pumpswap] DEDUP-SIG: Duplicate CreatePool TX ${signature.slice(0, 16)}... (map size: ${this.processedSignatures.size})`);
-      }
-      return;
-    }
-    const now = Date.now();
-    this.processedSignatures.set(signature, now);
+    if (this.processedSignatures.has(signature)) return;
+    this.processedSignatures.set(signature, Date.now());
+    // v11k: Cleanup moved to periodic interval (was O(n) on every callback)
 
-    // v9f: Time-based cleanup (remove entries older than 30 min) every 2000 entries
-    if (this.processedSignatures.size > 2000) {
-      const cutoff = now - PumpSwapMonitor.DEDUP_RETENTION_MS;
-      for (const [sig, ts] of this.processedSignatures) {
-        if (ts < cutoff) this.processedSignatures.delete(sig);
-      }
-    }
-
-    // Look for pool creation events in PumpSwap
+    // v11k: Fast path — 99.8% of msgs are swaps, not pool creations.
+    // Single string search 'CreatePool' catches both full and short variants.
+    // 'create_pool' is the anchor snake_case variant.
     const isPoolCreate = logs.some(
-      (log) =>
-        log.includes('Program log: Instruction: CreatePool') ||
-        log.includes('CreatePool') ||
-        log.includes('create_pool'),
+      (log) => log.includes('CreatePool') || log.includes('create_pool'),
     );
 
     if (!isPoolCreate) return;
