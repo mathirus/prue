@@ -667,6 +667,63 @@ export class TradeLogger {
     }
   }
 
+  // ─── v7 ML pipeline: prediction tracking ─────────────────────────────
+
+  /**
+   * v7: Log an ML prediction for later accuracy analysis.
+   * Fire-and-forget — non-critical data collection.
+   */
+  logMlPrediction(data: {
+    poolAddress: string;
+    tokenMint: string;
+    modelId: string;
+    prediction: string;
+    confidence: number;
+    features: Record<string, unknown>;
+    wasBlocked: boolean;
+  }): void {
+    try {
+      const db = getDb();
+      db.prepare(`
+        INSERT INTO ml_predictions
+        (pool_address, token_mint, model_id, prediction, confidence, features, was_blocked, predicted_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(
+        data.poolAddress,
+        data.tokenMint,
+        data.modelId,
+        data.prediction,
+        data.confidence,
+        JSON.stringify(data.features),
+        data.wasBlocked ? 1 : 0,
+        Date.now(),
+      );
+    } catch (err) {
+      logger.debug(`[trade-logger] Failed to log ML prediction: ${err}`);
+    }
+  }
+
+  /**
+   * v7: Backfill actual_outcome on ml_predictions from detected_pools.pool_outcome.
+   * Returns number of rows updated.
+   */
+  backfillMlPredictionOutcomes(): number {
+    try {
+      const db = getDb();
+      const result = db.prepare(`
+        UPDATE ml_predictions SET actual_outcome = dp.pool_outcome
+        FROM detected_pools dp
+        WHERE ml_predictions.pool_address = dp.pool_address
+          AND dp.pool_outcome IN ('rug', 'survivor')
+          AND ml_predictions.actual_outcome IS NULL
+      `).run();
+      return result.changes;
+    } catch (err) {
+      logger.debug(`[trade-logger] Failed to backfill ML prediction outcomes: ${err}`);
+      return 0;
+    }
+  }
+
   // ─── v9a: Shadow mode methods ────────────────────────────────────────
 
   /**
