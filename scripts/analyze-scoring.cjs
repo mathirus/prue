@@ -1,683 +1,778 @@
 #!/usr/bin/env node
 /**
- * Comprehensive Scoring Analysis Script
- * Analyzes scoring effectiveness, penalidades, filtros, and outcomes
+ * analyze-scoring.cjs — Scoring component analysis & ML readiness assessment
+ *
+ * Analyzes which scoring penalties/bonuses best discriminate rugs from survivors,
+ * identifies penalty combos that let rugs through, and assesses ML training readiness.
+ *
+ * Usage:
+ *   node scripts/analyze-scoring.cjs                        # Full report
+ *   node scripts/analyze-scoring.cjs --section penalty_vs_outcome  # Single section
+ *   node scripts/analyze-scoring.cjs --version v11s          # Filter version
+ *   node scripts/analyze-scoring.cjs --since 2h              # Last 2 hours
+ *
+ * Sections: data_audit, penalty_vs_outcome, penalty_combos, position_correlation,
+ *           broad_features, rejection_analysis, ml_readiness
  */
+
 const Database = require('better-sqlite3');
 const path = require('path');
 
-const db = new Database(path.join(__dirname, '..', 'data', 'bot.db'), { readonly: true });
+const DB_PATH = path.join(__dirname, '..', 'data', 'bot.db');
 
-function section(title) {
-  console.log('\n' + '='.repeat(80));
-  console.log(`  ${title}`);
-  console.log('='.repeat(80));
+// ── Arg parsing (same pattern as analyze-v11o.cjs) ──────────────────────
+const args = process.argv.slice(2);
+function getArg(name) {
+  const i = args.indexOf(`--${name}`);
+  if (i === -1) return null;
+  return args[i + 1] || true;
 }
 
-function subsection(title) {
+const filterVersion = getArg('version');
+const sinceArg = getArg('since');
+const sectionFilter = getArg('section');
+
+function parseSince(s) {
+  if (!s) return 0;
+  const m = String(s).match(/^(\d+)(h|m|d)$/);
+  if (!m) return 0;
+  const n = parseInt(m[1]);
+  if (m[2] === 'h') return Date.now() - n * 3600_000;
+  if (m[2] === 'm') return Date.now() - n * 60_000;
+  if (m[2] === 'd') return Date.now() - n * 86400_000;
+  return 0;
+}
+
+const sinceTs = parseSince(sinceArg);
+
+const db = new Database(DB_PATH, { readonly: true });
+
+// ── Helpers ─────────────────────────────────────────────────────────────
+
+function versionWhereDP(col = 'bot_version') {
+  const parts = [];
+  if (filterVersion) {
+    parts.push(`${col} = '${filterVersion}'`);
+  } else {
+    parts.push(`${col} >= 'v11o'`);
+  }
+  if (sinceTs > 0) {
+    parts.push(`detected_at > ${sinceTs}`);
+  }
+  return parts.join(' AND ');
+}
+
+function versionWherePos(col = 'bot_version') {
+  const parts = [];
+  if (filterVersion) {
+    parts.push(`${col} = '${filterVersion}'`);
+  } else {
+    parts.push(`${col} >= 'v11o'`);
+  }
+  if (sinceTs > 0) {
+    parts.push(`opened_at > ${sinceTs}`);
+  }
+  return parts.join(' AND ');
+}
+
+function header(title) {
+  console.log(`\n${'='.repeat(70)}`);
+  console.log(`  ${title}`);
+  console.log('='.repeat(70));
+}
+
+function subheader(title) {
   console.log(`\n--- ${title} ---`);
 }
 
-// ============================================================
-// 1. SCORE DISTRIBUTION (ALL DETECTED POOLS)
-// ============================================================
-section('1. SCORE DISTRIBUTION — ALL DETECTED POOLS (N=' +
-  db.prepare('SELECT COUNT(*) as n FROM detected_pools WHERE security_score IS NOT NULL').get().n + ')');
-
-const scoreHist = db.prepare(`
-  SELECT
-    CASE
-      WHEN security_score < 0 THEN '<0'
-      WHEN security_score BETWEEN 0 AND 9 THEN '0-9'
-      WHEN security_score BETWEEN 10 AND 19 THEN '10-19'
-      WHEN security_score BETWEEN 20 AND 29 THEN '20-29'
-      WHEN security_score BETWEEN 30 AND 39 THEN '30-39'
-      WHEN security_score BETWEEN 40 AND 49 THEN '40-49'
-      WHEN security_score BETWEEN 50 AND 59 THEN '50-59'
-      WHEN security_score BETWEEN 60 AND 69 THEN '60-69'
-      WHEN security_score BETWEEN 70 AND 79 THEN '70-79'
-      WHEN security_score BETWEEN 80 AND 89 THEN '80-89'
-      WHEN security_score BETWEEN 90 AND 100 THEN '90-100'
-      ELSE '>100'
-    END as range,
-    COUNT(*) as count,
-    ROUND(COUNT(*) * 100.0 / (SELECT COUNT(*) FROM detected_pools WHERE security_score IS NOT NULL), 1) as pct
-  FROM detected_pools
-  WHERE security_score IS NOT NULL
-  GROUP BY range
-  ORDER BY MIN(security_score)
-`).all();
-console.log('\nScore Range | Count  | %');
-console.log('-'.repeat(40));
-scoreHist.forEach(r => console.log(`${r.range.padEnd(11)} | ${String(r.count).padStart(6)} | ${r.pct}%`));
-
-// Score distribution for BOUGHT tokens
-subsection('Score Distribution — BOUGHT TOKENS (positions)');
-const boughtScoreHist = db.prepare(`
-  SELECT
-    CASE
-      WHEN security_score BETWEEN 60 AND 64 THEN '60-64'
-      WHEN security_score BETWEEN 65 AND 69 THEN '65-69'
-      WHEN security_score BETWEEN 70 AND 74 THEN '70-74'
-      WHEN security_score BETWEEN 75 AND 79 THEN '75-79'
-      WHEN security_score BETWEEN 80 AND 84 THEN '80-84'
-      WHEN security_score BETWEEN 85 AND 89 THEN '85-89'
-      WHEN security_score BETWEEN 90 AND 100 THEN '90-100'
-      ELSE 'other'
-    END as range,
-    COUNT(*) as count,
-    SUM(CASE WHEN pnl_sol > 0 THEN 1 ELSE 0 END) as wins,
-    SUM(CASE WHEN pnl_sol <= 0 THEN 1 ELSE 0 END) as losses,
-    SUM(CASE WHEN exit_reason LIKE '%rug%' OR exit_reason LIKE '%honeypot%' THEN 1 ELSE 0 END) as rugs,
-    ROUND(SUM(CASE WHEN pnl_sol > 0 THEN 1.0 ELSE 0 END) / COUNT(*) * 100, 1) as win_rate,
-    ROUND(SUM(pnl_sol), 4) as total_pnl,
-    ROUND(AVG(pnl_sol), 5) as avg_pnl,
-    ROUND(AVG(peak_multiplier), 2) as avg_peak
-  FROM positions
-  WHERE status = 'closed' AND security_score IS NOT NULL
-  GROUP BY range
-  ORDER BY MIN(security_score)
-`).all();
-console.log('\nRange  | N    | Wins | Loss | Rugs | WinRate | TotalPnL  | AvgPnL    | AvgPeak');
-console.log('-'.repeat(95));
-boughtScoreHist.forEach(r =>
-  console.log(`${r.range.padEnd(6)} | ${String(r.count).padStart(4)} | ${String(r.wins).padStart(4)} | ${String(r.losses).padStart(4)} | ${String(r.rugs).padStart(4)} | ${String(r.win_rate).padStart(5)}%  | ${String(r.total_pnl).padStart(9)} | ${String(r.avg_pnl).padStart(9)} | ${r.avg_peak}x`)
-);
-
-// ============================================================
-// 2. PENALTY/BONUS FREQUENCY AND IMPACT
-// ============================================================
-section('2. PENALTY & BONUS FREQUENCY — ALL DETECTED POOLS');
-
-// Analyze individual penalty fields
-const penaltyAnalysis = db.prepare(`
-  SELECT
-    'mint_NOT_revoked' as filter,
-    SUM(CASE WHEN dp_mint_auth_revoked = 0 OR dp_mint_auth_revoked IS NULL THEN 1 ELSE 0 END) as active_count,
-    COUNT(*) as total,
-    ROUND(SUM(CASE WHEN dp_mint_auth_revoked = 0 OR dp_mint_auth_revoked IS NULL THEN 1.0 ELSE 0 END) / COUNT(*) * 100, 1) as pct
-  FROM detected_pools WHERE security_score IS NOT NULL
-  UNION ALL
-  SELECT 'freeze_NOT_revoked',
-    SUM(CASE WHEN dp_freeze_auth_revoked = 0 OR dp_freeze_auth_revoked IS NULL THEN 1 ELSE 0 END),
-    COUNT(*),
-    ROUND(SUM(CASE WHEN dp_freeze_auth_revoked = 0 OR dp_freeze_auth_revoked IS NULL THEN 1.0 ELSE 0 END) / COUNT(*) * 100, 1)
-  FROM detected_pools WHERE security_score IS NOT NULL
-  UNION ALL
-  SELECT 'honeypot_NOT_verified',
-    SUM(CASE WHEN dp_honeypot_verified = 0 OR dp_honeypot_verified IS NULL THEN 1 ELSE 0 END),
-    COUNT(*),
-    ROUND(SUM(CASE WHEN dp_honeypot_verified = 0 OR dp_honeypot_verified IS NULL THEN 1.0 ELSE 0 END) / COUNT(*) * 100, 1)
-  FROM detected_pools WHERE security_score IS NOT NULL
-  UNION ALL
-  SELECT 'lp_NOT_burned',
-    SUM(CASE WHEN dp_lp_burned = 0 OR dp_lp_burned IS NULL THEN 1 ELSE 0 END),
-    COUNT(*),
-    ROUND(SUM(CASE WHEN dp_lp_burned = 0 OR dp_lp_burned IS NULL THEN 1.0 ELSE 0 END) / COUNT(*) * 100, 1)
-  FROM detected_pools WHERE security_score IS NOT NULL
-  UNION ALL
-  SELECT 'bundle_penalty_active',
-    SUM(CASE WHEN dp_bundle_penalty > 0 THEN 1 ELSE 0 END),
-    COUNT(*),
-    ROUND(SUM(CASE WHEN dp_bundle_penalty > 0 THEN 1.0 ELSE 0 END) / COUNT(*) * 100, 1)
-  FROM detected_pools WHERE security_score IS NOT NULL
-  UNION ALL
-  SELECT 'wash_penalty_active',
-    SUM(CASE WHEN dp_wash_penalty > 0 THEN 1 ELSE 0 END),
-    COUNT(*),
-    ROUND(SUM(CASE WHEN dp_wash_penalty > 0 THEN 1.0 ELSE 0 END) / COUNT(*) * 100, 1)
-  FROM detected_pools WHERE security_score IS NOT NULL
-  UNION ALL
-  SELECT 'insiders_present',
-    SUM(CASE WHEN dp_insiders_count > 0 THEN 1 ELSE 0 END),
-    COUNT(*),
-    ROUND(SUM(CASE WHEN dp_insiders_count > 0 THEN 1.0 ELSE 0 END) / COUNT(*) * 100, 1)
-  FROM detected_pools WHERE security_score IS NOT NULL
-  UNION ALL
-  SELECT 'hidden_whales',
-    SUM(CASE WHEN dp_hidden_whale_count > 0 THEN 1 ELSE 0 END),
-    COUNT(*),
-    ROUND(SUM(CASE WHEN dp_hidden_whale_count > 0 THEN 1.0 ELSE 0 END) / COUNT(*) * 100, 1)
-  FROM detected_pools WHERE security_score IS NOT NULL
-  UNION ALL
-  SELECT 'creator_rep_negative',
-    SUM(CASE WHEN dp_creator_reputation < 0 THEN 1 ELSE 0 END),
-    COUNT(*),
-    ROUND(SUM(CASE WHEN dp_creator_reputation < 0 THEN 1.0 ELSE 0 END) / COUNT(*) * 100, 1)
-  FROM detected_pools WHERE security_score IS NOT NULL
-  UNION ALL
-  SELECT 'observation_unstable',
-    SUM(CASE WHEN dp_observation_stable = 0 THEN 1 ELSE 0 END),
-    COUNT(*),
-    ROUND(SUM(CASE WHEN dp_observation_stable = 0 THEN 1.0 ELSE 0 END) / COUNT(*) * 100, 1)
-  FROM detected_pools WHERE security_score IS NOT NULL
-  UNION ALL
-  SELECT 'graduation_fast(<300s)',
-    SUM(CASE WHEN dp_graduation_time_s IS NOT NULL AND dp_graduation_time_s < 300 THEN 1 ELSE 0 END),
-    COUNT(*),
-    ROUND(SUM(CASE WHEN dp_graduation_time_s IS NOT NULL AND dp_graduation_time_s < 300 THEN 1.0 ELSE 0 END) / COUNT(*) * 100, 1)
-  FROM detected_pools WHERE security_score IS NOT NULL
-  UNION ALL
-  SELECT 'low_liquidity(<5K)',
-    SUM(CASE WHEN dp_liquidity_usd < 5000 THEN 1 ELSE 0 END),
-    COUNT(*),
-    ROUND(SUM(CASE WHEN dp_liquidity_usd < 5000 THEN 1.0 ELSE 0 END) / COUNT(*) * 100, 1)
-  FROM detected_pools WHERE security_score IS NOT NULL
-  UNION ALL
-  SELECT 'high_top_holder(>50%)',
-    SUM(CASE WHEN dp_top_holder_pct > 50 THEN 1 ELSE 0 END),
-    COUNT(*),
-    ROUND(SUM(CASE WHEN dp_top_holder_pct > 50 THEN 1.0 ELSE 0 END) / COUNT(*) * 100, 1)
-  FROM detected_pools WHERE security_score IS NOT NULL
-`).all();
-
-console.log('\nFilter/Penalty         | Active | Total  | %');
-console.log('-'.repeat(55));
-penaltyAnalysis.forEach(r =>
-  console.log(`${r.filter.padEnd(23)}| ${String(r.active_count).padStart(6)} | ${String(r.total).padStart(6)} | ${r.pct}%`)
-);
-
-// Bundle penalty distribution
-subsection('Bundle Penalty Distribution');
-const bundleDist = db.prepare(`
-  SELECT dp_bundle_penalty as penalty, COUNT(*) as n
-  FROM detected_pools
-  WHERE dp_bundle_penalty IS NOT NULL AND dp_bundle_penalty != 0
-  GROUP BY dp_bundle_penalty ORDER BY dp_bundle_penalty
-`).all();
-bundleDist.forEach(r => console.log(`  Bundle penalty ${r.penalty}: ${r.n} tokens`));
-
-// Wash penalty distribution
-subsection('Wash Penalty Distribution');
-const washDist = db.prepare(`
-  SELECT dp_wash_penalty as penalty, COUNT(*) as n
-  FROM detected_pools
-  WHERE dp_wash_penalty IS NOT NULL AND dp_wash_penalty != 0
-  GROUP BY dp_wash_penalty ORDER BY dp_wash_penalty
-`).all();
-washDist.forEach(r => console.log(`  Wash penalty ${r.penalty}: ${r.n} tokens`));
-
-// Creator reputation distribution
-subsection('Creator Reputation Distribution');
-const repDist = db.prepare(`
-  SELECT dp_creator_reputation as rep, COUNT(*) as n
-  FROM detected_pools
-  WHERE dp_creator_reputation IS NOT NULL
-  GROUP BY dp_creator_reputation ORDER BY dp_creator_reputation
-`).all();
-repDist.forEach(r => console.log(`  Creator rep ${r.rep}: ${r.n} tokens`));
-
-// ============================================================
-// 3. REJECTION STAGE ANALYSIS
-// ============================================================
-section('3. REJECTION STAGES');
-const rejStages = db.prepare(`
-  SELECT
-    COALESCE(dp_rejection_stage, 'PASSED') as stage,
-    COUNT(*) as n,
-    ROUND(COUNT(*) * 100.0 / (SELECT COUNT(*) FROM detected_pools), 1) as pct,
-    ROUND(AVG(security_score), 1) as avg_score
-  FROM detected_pools
-  GROUP BY stage
-  ORDER BY n DESC
-`).all();
-console.log('\nStage           | Count  | %     | Avg Score');
-console.log('-'.repeat(50));
-rejStages.forEach(r =>
-  console.log(`${r.stage.padEnd(16)}| ${String(r.n).padStart(6)} | ${String(r.pct).padStart(5)}% | ${r.avg_score}`)
-);
-
-// ============================================================
-// 4. FILTER EFFECTIVENESS — LIFT ANALYSIS (BOUGHT TOKENS ONLY)
-// ============================================================
-section('4. FILTER EFFECTIVENESS — LIFT ANALYSIS (Bought Tokens)');
-
-const closedPositions = db.prepare(`SELECT COUNT(*) as n FROM positions WHERE status='closed'`).get().n;
-console.log(`\nTotal closed positions: ${closedPositions}`);
-
-// Join positions with detected_pools for penalty data
-const liftQuery = (filterName, condition) => {
-  try {
-    const result = db.prepare(`
-      SELECT
-        '${filterName}' as filter,
-        SUM(CASE WHEN (${condition}) AND (p.exit_reason LIKE '%rug%' OR p.exit_reason LIKE '%honeypot%') THEN 1 ELSE 0 END) as rugs_with,
-        SUM(CASE WHEN (${condition}) AND p.pnl_sol > 0 THEN 1 ELSE 0 END) as wins_with,
-        SUM(CASE WHEN (${condition}) THEN 1 ELSE 0 END) as total_with,
-        SUM(CASE WHEN NOT (${condition}) AND (p.exit_reason LIKE '%rug%' OR p.exit_reason LIKE '%honeypot%') THEN 1 ELSE 0 END) as rugs_without,
-        SUM(CASE WHEN NOT (${condition}) AND p.pnl_sol > 0 THEN 1 ELSE 0 END) as wins_without,
-        SUM(CASE WHEN NOT (${condition}) THEN 1 ELSE 0 END) as total_without,
-        COUNT(*) as total
-      FROM positions p
-      LEFT JOIN detected_pools d ON p.pool_address = d.pool_address
-      WHERE p.status = 'closed'
-    `).get();
-    return result;
-  } catch(e) {
-    return null;
-  }
-};
-
-const filters = [
-  ['bundle_penalty>0', 'd.dp_bundle_penalty > 0'],
-  ['wash_penalty>0', 'd.dp_wash_penalty > 0'],
-  ['insiders>0', 'd.dp_insiders_count > 0'],
-  ['hidden_whales>0', 'd.dp_hidden_whale_count > 0'],
-  ['creator_rep<0', 'd.dp_creator_reputation < 0'],
-  ['obs_unstable', 'd.dp_observation_stable = 0'],
-  ['grad_fast(<300s)', 'd.dp_graduation_time_s IS NOT NULL AND d.dp_graduation_time_s < 300'],
-  ['grad_instant(<60s)', 'd.dp_graduation_time_s IS NOT NULL AND d.dp_graduation_time_s < 60'],
-  ['top_holder>30%', 'd.dp_top_holder_pct > 30'],
-  ['top_holder>50%', 'd.dp_top_holder_pct > 50'],
-  ['liq<10K', 'd.dp_liquidity_usd < 10000'],
-  ['liq<5K', 'd.dp_liquidity_usd < 5000'],
-  ['rugcheck<50', 'd.dp_rugcheck_score IS NOT NULL AND d.dp_rugcheck_score < 50'],
-  ['obs_drop>10%', 'd.dp_observation_drop_pct > 10'],
-  ['obs_drop>20%', 'd.dp_observation_drop_pct > 20'],
-  ['velocity>10', 'd.dp_tx_velocity > 10'],
-  ['wash_conc>0.5', 'd.dp_wash_concentration > 0.5'],
-];
-
-console.log('\nFilter               | With: Rugs/Wins/N | Without: Rugs/Wins/N | Rug%↑ Win%↓ | LIFT');
-console.log('-'.repeat(95));
-
-filters.forEach(([name, cond]) => {
-  const r = liftQuery(name, cond);
-  if (!r || r.total_with === 0) {
-    console.log(`${name.padEnd(21)}| NO DATA`);
-    return;
-  }
-  const rugPctWith = r.total_with > 0 ? (r.rugs_with / r.total_with * 100) : 0;
-  const winPctWith = r.total_with > 0 ? (r.wins_with / r.total_with * 100) : 0;
-  const rugPctWithout = r.total_without > 0 ? (r.rugs_without / r.total_without * 100) : 0;
-  const winPctWithout = r.total_without > 0 ? (r.wins_without / r.total_without * 100) : 0;
-  const lift = winPctWith > 0 ? (rugPctWith / Math.max(winPctWith, 0.1)).toFixed(2) : 'INF';
-  const liftVsBase = rugPctWithout > 0 ? (rugPctWith / rugPctWithout).toFixed(2) : 'N/A';
-
-  console.log(
-    `${name.padEnd(21)}| ${r.rugs_with}/${r.wins_with}/${r.total_with}`.padEnd(35) +
-    `| ${r.rugs_without}/${r.wins_without}/${r.total_without}`.padEnd(25) +
-    `| ${rugPctWith.toFixed(0)}%/${winPctWith.toFixed(0)}%`.padEnd(14) +
-    `| ${liftVsBase}`
-  );
-});
-
-// ============================================================
-// 5. EXIT REASON ANALYSIS
-// ============================================================
-section('5. EXIT REASON BREAKDOWN');
-const exitReasons = db.prepare(`
-  SELECT
-    exit_reason,
-    COUNT(*) as n,
-    ROUND(AVG(pnl_sol), 5) as avg_pnl,
-    ROUND(SUM(pnl_sol), 4) as total_pnl,
-    ROUND(AVG(peak_multiplier), 2) as avg_peak,
-    ROUND(AVG(security_score), 1) as avg_score,
-    ROUND(AVG(sell_attempts), 1) as avg_sell_attempts,
-    ROUND(AVG(sell_successes), 1) as avg_sell_successes
-  FROM positions
-  WHERE status = 'closed'
-  GROUP BY exit_reason
-  ORDER BY n DESC
-`).all();
-console.log('\nExit Reason              | N    | Avg PnL   | Total PnL | AvgPeak | AvgScore | SellAttempts/Success');
-console.log('-'.repeat(100));
-exitReasons.forEach(r =>
-  console.log(
-    `${(r.exit_reason || 'null').padEnd(25)}| ${String(r.n).padStart(4)} | ${String(r.avg_pnl).padStart(9)} | ${String(r.total_pnl).padStart(9)} | ${String(r.avg_peak).padStart(5)}x  | ${String(r.avg_score).padStart(6)}   | ${r.avg_sell_attempts}/${r.avg_sell_successes}`
-  )
-);
-
-// ============================================================
-// 6. POOL OUTCOME vs SCORE (REJECTED TOKENS)
-// ============================================================
-section('6. REJECTED TOKENS — MISSED OPPORTUNITIES');
-
-const rejectedOutcomes = db.prepare(`
-  SELECT
-    pool_outcome,
-    COUNT(*) as n,
-    ROUND(AVG(security_score), 1) as avg_score,
-    dp_rejection_stage as stage
-  FROM detected_pools
-  WHERE security_passed = 0 AND pool_outcome IS NOT NULL AND pool_outcome != ''
-  GROUP BY pool_outcome, dp_rejection_stage
-  ORDER BY n DESC
-  LIMIT 30
-`).all();
-
-console.log('\nOutcome               | Stage          | N    | Avg Score');
-console.log('-'.repeat(65));
-rejectedOutcomes.forEach(r =>
-  console.log(`${(r.pool_outcome || 'null').padEnd(22)}| ${(r.stage || 'none').padEnd(15)}| ${String(r.n).padStart(4)} | ${r.avg_score}`)
-);
-
-// Specifically: rejected tokens that survived (didn't rug)
-subsection('Rejected tokens with GOOD outcomes');
-const goodRejected = db.prepare(`
-  SELECT
-    COUNT(*) as total_rejected,
-    SUM(CASE WHEN pool_outcome IN ('survived', 'growing', 'moon') THEN 1 ELSE 0 END) as good_outcomes,
-    SUM(CASE WHEN pool_outcome IN ('rugged', 'dead', 'honeypot') THEN 1 ELSE 0 END) as bad_outcomes,
-    SUM(CASE WHEN pool_outcome IS NULL OR pool_outcome = '' THEN 1 ELSE 0 END) as unknown
-  FROM detected_pools
-  WHERE security_passed = 0
-`).get();
-console.log(`Total rejected: ${goodRejected.total_rejected}`);
-console.log(`Good outcomes (survived/growing/moon): ${goodRejected.good_outcomes} (${(goodRejected.good_outcomes/goodRejected.total_rejected*100).toFixed(1)}%)`);
-console.log(`Bad outcomes (rugged/dead/honeypot): ${goodRejected.bad_outcomes} (${(goodRejected.bad_outcomes/goodRejected.total_rejected*100).toFixed(1)}%)`);
-console.log(`Unknown outcome: ${goodRejected.unknown} (${(goodRejected.unknown/goodRejected.total_rejected*100).toFixed(1)}%)`);
-
-// Good rejected tokens by score range
-subsection('Good rejected tokens by score range');
-const goodRejByScore = db.prepare(`
-  SELECT
-    CASE
-      WHEN security_score BETWEEN 50 AND 59 THEN '50-59'
-      WHEN security_score BETWEEN 60 AND 64 THEN '60-64'
-      WHEN security_score BETWEEN 65 AND 69 THEN '65-69'
-      WHEN security_score BETWEEN 70 AND 74 THEN '70-74'
-      WHEN security_score BETWEEN 75 AND 79 THEN '75-79'
-      WHEN security_score < 50 THEN '<50'
-      ELSE '80+'
-    END as range,
-    COUNT(*) as total,
-    SUM(CASE WHEN pool_outcome IN ('survived', 'growing', 'moon') THEN 1 ELSE 0 END) as good,
-    ROUND(SUM(CASE WHEN pool_outcome IN ('survived', 'growing', 'moon') THEN 1.0 ELSE 0 END) / NULLIF(COUNT(*), 0) * 100, 1) as good_pct
-  FROM detected_pools
-  WHERE security_passed = 0 AND pool_outcome IS NOT NULL AND pool_outcome != ''
-  GROUP BY range
-  ORDER BY MIN(security_score)
-`).all();
-console.log('\nScore Range | Total Rej | Good | Good%');
-console.log('-'.repeat(45));
-goodRejByScore.forEach(r =>
-  console.log(`${r.range.padEnd(12)}| ${String(r.total).padStart(9)} | ${String(r.good).padStart(4)} | ${r.good_pct}%`)
-);
-
-// ============================================================
-// 7. CREATOR ANALYSIS
-// ============================================================
-section('7. CREATOR WALLET ANALYSIS');
-
-const creatorOutcome = db.prepare(`
-  SELECT
-    outcome,
-    COUNT(*) as n,
-    ROUND(AVG(wallet_age_seconds), 0) as avg_age_s,
-    ROUND(AVG(tx_count), 0) as avg_txs,
-    ROUND(AVG(reputation_score), 1) as avg_rep
-  FROM token_creators
-  WHERE outcome IS NOT NULL AND outcome != 'unknown'
-  GROUP BY outcome
-  ORDER BY n DESC
-`).all();
-console.log('\nOutcome | N    | Avg Age(s) | Avg TXs | Avg Rep');
-console.log('-'.repeat(55));
-creatorOutcome.forEach(r =>
-  console.log(`${r.outcome.padEnd(8)}| ${String(r.n).padStart(4)} | ${String(r.avg_age_s).padStart(10)} | ${String(r.avg_txs).padStart(7)} | ${r.avg_rep}`)
-);
-
-// Creator age buckets vs outcome
-subsection('Creator Age Buckets vs Outcome');
-const ageBuckets = db.prepare(`
-  SELECT
-    CASE
-      WHEN wallet_age_seconds < 60 THEN '<1min'
-      WHEN wallet_age_seconds < 300 THEN '1-5min'
-      WHEN wallet_age_seconds < 3600 THEN '5-60min'
-      WHEN wallet_age_seconds < 86400 THEN '1-24hr'
-      ELSE '>24hr'
-    END as age_bucket,
-    COUNT(*) as total,
-    SUM(CASE WHEN outcome = 'rug' THEN 1 ELSE 0 END) as rugs,
-    SUM(CASE WHEN outcome = 'safe' THEN 1 ELSE 0 END) as safe,
-    ROUND(SUM(CASE WHEN outcome = 'rug' THEN 1.0 ELSE 0 END) / NULLIF(SUM(CASE WHEN outcome IN ('rug','safe') THEN 1 ELSE 0 END), 0) * 100, 1) as rug_rate
-  FROM token_creators
-  WHERE wallet_age_seconds IS NOT NULL AND outcome IN ('rug', 'safe')
-  GROUP BY age_bucket
-  ORDER BY MIN(wallet_age_seconds)
-`).all();
-console.log('\nAge Bucket | Total | Rugs | Safe | Rug Rate');
-console.log('-'.repeat(50));
-ageBuckets.forEach(r =>
-  console.log(`${r.age_bucket.padEnd(11)}| ${String(r.total).padStart(5)} | ${String(r.rugs).padStart(4)} | ${String(r.safe).padStart(4)} | ${r.rug_rate}%`)
-);
-
-// Reputation score vs outcome
-subsection('Reputation Score vs Outcome');
-const repOutcome = db.prepare(`
-  SELECT
-    reputation_score as rep,
-    COUNT(*) as total,
-    SUM(CASE WHEN outcome = 'rug' THEN 1 ELSE 0 END) as rugs,
-    SUM(CASE WHEN outcome = 'safe' THEN 1 ELSE 0 END) as safe,
-    ROUND(SUM(CASE WHEN outcome = 'rug' THEN 1.0 ELSE 0 END) / NULLIF(SUM(CASE WHEN outcome IN ('rug','safe') THEN 1 ELSE 0 END), 0) * 100, 1) as rug_rate
-  FROM token_creators
-  WHERE reputation_score IS NOT NULL AND outcome IN ('rug', 'safe')
-  GROUP BY reputation_score
-  ORDER BY reputation_score
-`).all();
-console.log('\nRep Score | Total | Rugs | Safe | Rug Rate');
-console.log('-'.repeat(50));
-repOutcome.forEach(r =>
-  console.log(`${String(r.rep).padStart(9)} | ${String(r.total).padStart(5)} | ${String(r.rugs).padStart(4)} | ${String(r.safe).padStart(4)} | ${r.rug_rate}%`)
-);
-
-// ============================================================
-// 8. BOT VERSION COMPARISON
-// ============================================================
-section('8. BOT VERSION COMPARISON');
-const versionStats = db.prepare(`
-  SELECT
-    bot_version,
-    COUNT(*) as n,
-    SUM(CASE WHEN pnl_sol > 0 THEN 1 ELSE 0 END) as wins,
-    ROUND(SUM(CASE WHEN pnl_sol > 0 THEN 1.0 ELSE 0 END) / COUNT(*) * 100, 1) as win_rate,
-    ROUND(SUM(pnl_sol), 4) as total_pnl,
-    ROUND(AVG(pnl_sol), 5) as avg_pnl,
-    ROUND(AVG(peak_multiplier), 2) as avg_peak,
-    ROUND(AVG(security_score), 1) as avg_score,
-    SUM(CASE WHEN exit_reason LIKE '%rug%' OR exit_reason LIKE '%honeypot%' THEN 1 ELSE 0 END) as rugs
-  FROM positions
-  WHERE status = 'closed' AND bot_version IS NOT NULL
-  GROUP BY bot_version
-  ORDER BY MIN(opened_at) DESC
-`).all();
-console.log('\nVersion    | N    | Wins | WinR  | Rugs | TotalPnL  | AvgPnL    | AvgPeak | AvgScore');
-console.log('-'.repeat(100));
-versionStats.forEach(r =>
-  console.log(
-    `${(r.bot_version || '?').padEnd(11)}| ${String(r.n).padStart(4)} | ${String(r.wins).padStart(4)} | ${String(r.win_rate).padStart(5)}% | ${String(r.rugs).padStart(4)} | ${String(r.total_pnl).padStart(9)} | ${String(r.avg_pnl).padStart(9)} | ${String(r.avg_peak).padStart(5)}x  | ${r.avg_score}`)
-);
-
-// ============================================================
-// 9. OBSERVATION PHASE ANALYSIS
-// ============================================================
-section('9. OBSERVATION PHASE ANALYSIS');
-const obsAnalysis = db.prepare(`
-  SELECT
-    CASE
-      WHEN dp_observation_drop_pct IS NULL THEN 'no_data'
-      WHEN dp_observation_drop_pct <= 0 THEN 'growing'
-      WHEN dp_observation_drop_pct <= 5 THEN 'stable(0-5%)'
-      WHEN dp_observation_drop_pct <= 10 THEN 'minor_drop(5-10%)'
-      WHEN dp_observation_drop_pct <= 20 THEN 'drop(10-20%)'
-      ELSE 'big_drop(>20%)'
-    END as obs_bucket,
-    COUNT(*) as n,
-    SUM(CASE WHEN p.pnl_sol > 0 THEN 1 ELSE 0 END) as wins,
-    ROUND(SUM(CASE WHEN p.pnl_sol > 0 THEN 1.0 ELSE 0 END) / COUNT(*) * 100, 1) as win_rate,
-    ROUND(SUM(p.pnl_sol), 4) as total_pnl,
-    SUM(CASE WHEN p.exit_reason LIKE '%rug%' OR p.exit_reason LIKE '%honeypot%' THEN 1 ELSE 0 END) as rugs
-  FROM positions p
-  LEFT JOIN detected_pools d ON p.pool_address = d.pool_address
-  WHERE p.status = 'closed'
-  GROUP BY obs_bucket
-  ORDER BY MIN(dp_observation_drop_pct)
-`).all();
-console.log('\nObs Bucket        | N    | Wins | WinRate | TotalPnL  | Rugs');
-console.log('-'.repeat(70));
-obsAnalysis.forEach(r =>
-  console.log(`${r.obs_bucket.padEnd(18)}| ${String(r.n).padStart(4)} | ${String(r.wins).padStart(4)} | ${String(r.win_rate).padStart(5)}%  | ${String(r.total_pnl).padStart(9)} | ${r.rugs}`)
-);
-
-// ============================================================
-// 10. OPTIMAL MIN_SCORE SIMULATION
-// ============================================================
-section('10. OPTIMAL MIN_SCORE SIMULATION');
-console.log('\nSimulating different min_score thresholds on historical positions...');
-
-for (let threshold = 55; threshold <= 90; threshold += 5) {
-  const sim = db.prepare(`
-    SELECT
-      COUNT(*) as n,
-      SUM(CASE WHEN pnl_sol > 0 THEN 1 ELSE 0 END) as wins,
-      ROUND(SUM(CASE WHEN pnl_sol > 0 THEN 1.0 ELSE 0 END) / NULLIF(COUNT(*), 0) * 100, 1) as win_rate,
-      ROUND(SUM(pnl_sol), 4) as total_pnl,
-      SUM(CASE WHEN exit_reason LIKE '%rug%' OR exit_reason LIKE '%honeypot%' THEN 1 ELSE 0 END) as rugs,
-      ROUND(SUM(CASE WHEN exit_reason LIKE '%rug%' OR exit_reason LIKE '%honeypot%' THEN 1.0 ELSE 0 END) / NULLIF(COUNT(*), 0) * 100, 1) as rug_rate
-    FROM positions
-    WHERE status = 'closed' AND security_score >= ${threshold}
-  `).get();
-  console.log(
-    `  min_score=${threshold}: N=${sim.n}, Wins=${sim.wins} (${sim.win_rate}%), Rugs=${sim.rugs} (${sim.rug_rate}%), PnL=${sim.total_pnl}`
-  );
+function shouldShow(section) {
+  return !sectionFilter || sectionFilter === section;
 }
 
-// ============================================================
-// 11. WASH TRADING ANALYSIS
-// ============================================================
-section('11. WASH TRADING METRICS');
-const washAnalysis = db.prepare(`
-  SELECT
-    CASE
-      WHEN dp_wash_concentration IS NULL THEN 'no_data'
-      WHEN dp_wash_concentration <= 0.2 THEN 'low(0-0.2)'
-      WHEN dp_wash_concentration <= 0.5 THEN 'med(0.2-0.5)'
-      ELSE 'high(>0.5)'
-    END as wash_bucket,
-    COUNT(*) as n,
-    SUM(CASE WHEN p.pnl_sol > 0 THEN 1 ELSE 0 END) as wins,
-    ROUND(SUM(CASE WHEN p.pnl_sol > 0 THEN 1.0 ELSE 0 END) / COUNT(*) * 100, 1) as win_rate,
-    ROUND(SUM(p.pnl_sol), 4) as total_pnl,
-    SUM(CASE WHEN p.exit_reason LIKE '%rug%' OR p.exit_reason LIKE '%honeypot%' THEN 1 ELSE 0 END) as rugs
-  FROM positions p
-  LEFT JOIN detected_pools d ON p.pool_address = d.pool_address
-  WHERE p.status = 'closed'
-  GROUP BY wash_bucket
-`).all();
-console.log('\nWash Concentration | N    | Wins | WinRate | TotalPnL  | Rugs');
-console.log('-'.repeat(65));
-washAnalysis.forEach(r =>
-  console.log(`${r.wash_bucket.padEnd(19)}| ${String(r.n).padStart(4)} | ${String(r.wins).padStart(4)} | ${String(r.win_rate).padStart(5)}%  | ${String(r.total_pnl).padStart(9)} | ${r.rugs}`)
-);
+function pct(n, total) {
+  return total > 0 ? ((n / total) * 100).toFixed(1) : '0.0';
+}
 
-// ============================================================
-// 12. SELL DIFFICULTY ANALYSIS
-// ============================================================
-section('12. SELL DIFFICULTY ANALYSIS');
-const sellDifficulty = db.prepare(`
-  SELECT
-    CASE
-      WHEN sell_attempts <= 1 THEN '1_attempt'
-      WHEN sell_attempts <= 3 THEN '2-3_attempts'
-      WHEN sell_attempts <= 5 THEN '4-5_attempts'
-      ELSE '6+_attempts'
-    END as difficulty,
-    COUNT(*) as n,
-    ROUND(AVG(sell_successes * 1.0 / NULLIF(sell_attempts, 0)), 2) as success_rate,
-    ROUND(AVG(pnl_sol), 5) as avg_pnl,
-    ROUND(SUM(pnl_sol), 4) as total_pnl,
-    SUM(CASE WHEN exit_reason LIKE '%rug%' OR exit_reason LIKE '%honeypot%' THEN 1 ELSE 0 END) as rugs
-  FROM positions
-  WHERE status = 'closed' AND sell_attempts IS NOT NULL AND sell_attempts > 0
-  GROUP BY difficulty
-  ORDER BY MIN(sell_attempts)
-`).all();
-console.log('\nDifficulty    | N    | SuccessRate | AvgPnL    | TotalPnL  | Rugs');
-console.log('-'.repeat(70));
-sellDifficulty.forEach(r =>
-  console.log(`${r.difficulty.padEnd(14)}| ${String(r.n).padStart(4)} | ${String(r.success_rate).padStart(9)}   | ${String(r.avg_pnl).padStart(9)} | ${String(r.total_pnl).padStart(9)} | ${r.rugs}`)
-);
+// Cohen's d effect size: (mean1 - mean2) / pooled_std
+function cohensD(vals1, vals2) {
+  if (vals1.length < 2 || vals2.length < 2) return null;
+  const mean1 = vals1.reduce((s, v) => s + v, 0) / vals1.length;
+  const mean2 = vals2.reduce((s, v) => s + v, 0) / vals2.length;
+  const var1 = vals1.reduce((s, v) => s + (v - mean1) ** 2, 0) / (vals1.length - 1);
+  const var2 = vals2.reduce((s, v) => s + (v - mean2) ** 2, 0) / (vals2.length - 1);
+  const pooledStd = Math.sqrt(((vals1.length - 1) * var1 + (vals2.length - 1) * var2) / (vals1.length + vals2.length - 2));
+  if (pooledStd === 0) return null;
+  return (mean1 - mean2) / pooledStd;
+}
 
-// ============================================================
-// 13. PEAK MULTIPLIER ANALYSIS
-// ============================================================
-section('13. PEAK MULTIPLIER vs EXIT');
-const peakAnalysis = db.prepare(`
-  SELECT
-    CASE
-      WHEN peak_multiplier < 1.0 THEN '<1x(never_profit)'
-      WHEN peak_multiplier < 1.2 THEN '1.0-1.2x'
-      WHEN peak_multiplier < 1.5 THEN '1.2-1.5x'
-      WHEN peak_multiplier < 2.0 THEN '1.5-2.0x'
-      WHEN peak_multiplier < 3.0 THEN '2.0-3.0x'
-      ELSE '3x+'
-    END as peak_bucket,
-    COUNT(*) as n,
-    ROUND(AVG(pnl_pct), 1) as avg_pnl_pct,
-    ROUND(SUM(pnl_sol), 4) as total_pnl,
-    SUM(CASE WHEN pnl_sol > 0 THEN 1 ELSE 0 END) as ended_positive,
-    SUM(CASE WHEN exit_reason LIKE '%rug%' OR exit_reason LIKE '%honeypot%' THEN 1 ELSE 0 END) as rugs
-  FROM positions
-  WHERE status = 'closed' AND peak_multiplier IS NOT NULL
-  GROUP BY peak_bucket
-  ORDER BY MIN(peak_multiplier)
-`).all();
-console.log('\nPeak Bucket        | N    | Avg PnL% | TotalPnL  | EndedPos | Rugs');
-console.log('-'.repeat(75));
-peakAnalysis.forEach(r =>
-  console.log(`${r.peak_bucket.padEnd(19)}| ${String(r.n).padStart(4)} | ${String(r.avg_pnl_pct).padStart(7)}% | ${String(r.total_pnl).padStart(9)} | ${String(r.ended_positive).padStart(8)} | ${r.rugs}`)
-);
+// Pearson correlation
+function pearsonR(xs, ys) {
+  if (xs.length !== ys.length || xs.length < 3) return null;
+  const n = xs.length;
+  const meanX = xs.reduce((s, v) => s + v, 0) / n;
+  const meanY = ys.reduce((s, v) => s + v, 0) / n;
+  let num = 0, denX = 0, denY = 0;
+  for (let i = 0; i < n; i++) {
+    const dx = xs[i] - meanX;
+    const dy = ys[i] - meanY;
+    num += dx * dy;
+    denX += dx * dx;
+    denY += dy * dy;
+  }
+  const den = Math.sqrt(denX * denY);
+  return den === 0 ? null : num / den;
+}
 
-// ============================================================
-// 14. TIME-BASED ANALYSIS
-// ============================================================
-section('14. RECENT vs OLD PERFORMANCE');
-const timeAnalysis = db.prepare(`
-  SELECT
-    CASE
-      WHEN opened_at > strftime('%s','now') - 86400 THEN 'last_24h'
-      WHEN opened_at > strftime('%s','now') - 86400*3 THEN 'last_3d'
-      WHEN opened_at > strftime('%s','now') - 86400*7 THEN 'last_7d'
-      ELSE 'older'
-    END as period,
-    COUNT(*) as n,
-    SUM(CASE WHEN pnl_sol > 0 THEN 1 ELSE 0 END) as wins,
-    ROUND(SUM(CASE WHEN pnl_sol > 0 THEN 1.0 ELSE 0 END) / COUNT(*) * 100, 1) as win_rate,
-    ROUND(SUM(pnl_sol), 4) as total_pnl,
-    SUM(CASE WHEN exit_reason LIKE '%rug%' OR exit_reason LIKE '%honeypot%' THEN 1 ELSE 0 END) as rugs
-  FROM positions
-  WHERE status = 'closed'
-  GROUP BY period
-  ORDER BY MIN(opened_at) DESC
-`).all();
-console.log('\nPeriod    | N    | Wins | WinRate | TotalPnL  | Rugs');
-console.log('-'.repeat(60));
-timeAnalysis.forEach(r =>
-  console.log(`${r.period.padEnd(10)}| ${String(r.n).padStart(4)} | ${String(r.wins).padStart(4)} | ${String(r.win_rate).padStart(5)}%  | ${String(r.total_pnl).padStart(9)} | ${r.rugs}`)
-);
+// ── Penalty column definitions ──────────────────────────────────────────
+const PENALTY_COLS = [
+  { col: 'dp_holder_penalty', label: 'Holder', dir: 'penalty' },
+  { col: 'dp_rugcheck_penalty', label: 'RugCheck', dir: 'penalty' },
+  { col: 'dp_creator_age_penalty', label: 'Creator Age', dir: 'penalty' },
+  { col: 'dp_velocity_penalty', label: 'Velocity', dir: 'penalty' },
+  { col: 'dp_insider_penalty', label: 'Insider', dir: 'penalty' },
+  { col: 'dp_whale_penalty', label: 'Whale', dir: 'penalty' },
+  { col: 'dp_timing_cv_penalty', label: 'Timing CV', dir: 'penalty' },
+  { col: 'dp_hhi_penalty', label: 'HHI', dir: 'penalty' },
+  { col: 'dp_concentrated_penalty', label: 'Concentrated', dir: 'penalty' },
+  { col: 'dp_wash_penalty', label: 'Wash', dir: 'penalty' },
+  { col: 'dp_graduation_bonus', label: 'Graduation', dir: 'bonus' },
+  { col: 'dp_obs_bonus', label: 'Observation', dir: 'bonus' },
+  { col: 'dp_organic_bonus', label: 'Organic', dir: 'bonus' },
+  { col: 'dp_smart_wallet_bonus', label: 'Smart Wallet', dir: 'bonus' },
+  { col: 'dp_creator_reputation', label: 'Creator Rep', dir: 'mixed' },
+];
 
-// ============================================================
-// SUMMARY
-// ============================================================
-section('SUMMARY & ACTIONABLE CONCLUSIONS');
-console.log(`
-Data size:
-  - Detected pools: ${db.prepare('SELECT COUNT(*) as n FROM detected_pools').get().n}
-  - Positions (closed): ${db.prepare("SELECT COUNT(*) as n FROM positions WHERE status='closed'").get().n}
-  - Token creators: ${db.prepare('SELECT COUNT(*) as n FROM token_creators').get().n}
-  - Pool outcomes tracked: ${db.prepare("SELECT COUNT(*) as n FROM detected_pools WHERE pool_outcome IS NOT NULL AND pool_outcome != ''").get().n}
+// ═══════════════════════════════════════════════════════════════════════
+// SECTION: Data Audit
+// ═══════════════════════════════════════════════════════════════════════
+if (shouldShow('data_audit')) {
+  header('DATA AUDIT');
 
-NOTE: Review the numbers above to determine:
-  1. Which filters have high LIFT (rug% much higher than win%) → make stricter
-  2. Which filters have LIFT ~1 or <1 → consider relaxing or removing
-  3. What min_score maximizes PnL in the simulation
-  4. How many good tokens we're rejecting at the current threshold
-  5. Whether creator reputation actually predicts outcomes
-`);
+  // Pools with breakdowns by version
+  subheader('Pools with penalty breakdowns (dp_final_score NOT NULL)');
+  const byVersion = db.prepare(`
+    SELECT bot_version, COUNT(*) as n,
+      SUM(CASE WHEN pool_outcome = 'rug' THEN 1 ELSE 0 END) as rugs,
+      SUM(CASE WHEN pool_outcome = 'survivor' THEN 1 ELSE 0 END) as survivors,
+      SUM(CASE WHEN pool_outcome IS NULL OR pool_outcome = '' THEN 1 ELSE 0 END) as no_outcome
+    FROM detected_pools
+    WHERE dp_final_score IS NOT NULL AND ${versionWhereDP()}
+    GROUP BY bot_version ORDER BY bot_version
+  `).all();
+
+  console.log(`  ${'Version'.padEnd(8)} ${'Total'.padStart(6)} ${'Rugs'.padStart(6)} ${'Surv'.padStart(6)} ${'NoOut'.padStart(6)}`);
+  console.log(`  ${'-'.repeat(36)}`);
+  let totalBD = 0, totalBDRug = 0, totalBDSurv = 0;
+  for (const v of byVersion) {
+    console.log(`  ${v.bot_version.padEnd(8)} ${String(v.n).padStart(6)} ${String(v.rugs).padStart(6)} ${String(v.survivors).padStart(6)} ${String(v.no_outcome).padStart(6)}`);
+    totalBD += v.n; totalBDRug += v.rugs; totalBDSurv += v.survivors;
+  }
+  console.log(`  ${'TOTAL'.padEnd(8)} ${String(totalBD).padStart(6)} ${String(totalBDRug).padStart(6)} ${String(totalBDSurv).padStart(6)}`);
+
+  // Total pools with outcomes (any version)
+  subheader('All pools with outcomes (any version)');
+  const allOutcomes = db.prepare(`
+    SELECT pool_outcome, COUNT(*) as n FROM detected_pools
+    WHERE pool_outcome IN ('rug', 'survivor')
+    GROUP BY pool_outcome
+  `).all();
+  for (const o of allOutcomes) {
+    console.log(`  ${o.pool_outcome}: ${o.n}`);
+  }
+
+  // Positions that can JOIN to penalty data
+  subheader('Positions joinable to penalty breakdowns');
+  const joinable = db.prepare(`
+    SELECT COUNT(*) as n FROM positions p
+    JOIN detected_pools d ON p.pool_id = d.id
+    WHERE ${versionWherePos('p.bot_version')} AND d.dp_final_score IS NOT NULL
+      AND p.status IN ('stopped', 'closed')
+  `).get();
+  console.log(`  Positions with penalty data: ${joinable.n}`);
+
+  // Shadow positions status
+  subheader('Shadow positions data quality');
+  const shadowStats = db.prepare(`
+    SELECT COUNT(*) as total,
+      SUM(CASE WHEN rug_detected > 0 THEN 1 ELSE 0 END) as with_rug,
+      SUM(CASE WHEN tp1_hit > 0 THEN 1 ELSE 0 END) as with_tp1,
+      SUM(CASE WHEN peak_multiplier > 1.01 THEN 1 ELSE 0 END) as with_peak,
+      SUM(CASE WHEN total_polls > 0 THEN 1 ELSE 0 END) as with_polls,
+      SUM(CASE WHEN status = 'tracking' THEN 1 ELSE 0 END) as tracking,
+      SUM(CASE WHEN status = 'closed' THEN 1 ELSE 0 END) as closed
+    FROM shadow_positions
+  `).get();
+  console.log(`  Total shadow positions: ${shadowStats.total}`);
+  console.log(`  With rug_detected: ${shadowStats.with_rug}`);
+  console.log(`  With tp1_hit: ${shadowStats.with_tp1}`);
+  console.log(`  With peak > 1.01x: ${shadowStats.with_peak}`);
+  console.log(`  With any polls: ${shadowStats.with_polls}`);
+  console.log(`  Still tracking: ${shadowStats.tracking}`);
+  console.log(`  Closed: ${shadowStats.closed}`);
+  if (shadowStats.with_polls === 0 && shadowStats.total > 100) {
+    console.log(`  ** WARNING: ALL shadow positions have 0 polls — outcomes BROKEN **`);
+    console.log(`     Cause: live mode uses data-only shadow (no RPC polling)`);
+    console.log(`     Impact: ${shadowStats.total} unlabeled samples lost for ML training`);
+  }
+
+  // NULL rate per penalty column
+  subheader('Penalty column NULL rates (v11o+ with outcomes)');
+  for (const p of PENALTY_COLS) {
+    const result = db.prepare(`
+      SELECT COUNT(*) as total,
+        SUM(CASE WHEN ${p.col} IS NULL THEN 1 ELSE 0 END) as nulls
+      FROM detected_pools
+      WHERE dp_final_score IS NOT NULL AND pool_outcome IN ('rug', 'survivor')
+        AND ${versionWhereDP()}
+    `).get();
+    const nullPct = pct(result.nulls, result.total);
+    const flag = result.nulls > 0 ? ' !' : '';
+    console.log(`  ${p.label.padEnd(16)} ${String(result.nulls).padStart(4)}/${result.total} NULL (${nullPct}%)${flag}`);
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// SECTION: Penalty vs Outcome
+// ═══════════════════════════════════════════════════════════════════════
+if (shouldShow('penalty_vs_outcome')) {
+  header('PENALTY vs OUTCOME — Which components discriminate? (v11o+)');
+
+  const rows = db.prepare(`
+    SELECT pool_outcome, ${PENALTY_COLS.map(p => p.col).join(', ')}, dp_funder_fan_out
+    FROM detected_pools
+    WHERE dp_final_score IS NOT NULL AND pool_outcome IN ('rug', 'survivor')
+      AND ${versionWhereDP()}
+  `).all();
+
+  const rugs = rows.filter(r => r.pool_outcome === 'rug');
+  const survivors = rows.filter(r => r.pool_outcome === 'survivor');
+
+  console.log(`\n  Dataset: ${rows.length} pools (${rugs.length} rugs, ${survivors.length} survivors)`);
+
+  if (rows.length < 10) {
+    console.log('  Not enough data for meaningful analysis.');
+  } else {
+    // Per-penalty analysis
+    subheader('Effect size ranking (Cohen\'s d — higher abs = better discriminator)');
+    console.log(`  ${'Component'.padEnd(18)} ${'AvgRug'.padStart(8)} ${'AvgSurv'.padStart(8)} ${'Cohen d'.padStart(8)} ${'%Rug'.padStart(6)} ${'%Surv'.padStart(6)} ${'Dir'.padStart(5)}`);
+    console.log(`  ${'-'.repeat(60)}`);
+
+    const effectSizes = [];
+
+    for (const p of PENALTY_COLS) {
+      const rugVals = rugs.map(r => r[p.col] ?? 0);
+      const survVals = survivors.map(r => r[p.col] ?? 0);
+
+      const avgRug = rugVals.reduce((s, v) => s + v, 0) / rugVals.length;
+      const avgSurv = survVals.reduce((s, v) => s + v, 0) / survVals.length;
+      const d = cohensD(rugVals, survVals);
+
+      // Percentage that have non-zero value
+      const pctRug = pct(rugVals.filter(v => v !== 0).length, rugVals.length);
+      const pctSurv = pct(survVals.filter(v => v !== 0).length, survVals.length);
+
+      effectSizes.push({ ...p, avgRug, avgSurv, d, pctRug, pctSurv });
+    }
+
+    // Sort by absolute effect size
+    effectSizes.sort((a, b) => Math.abs(b.d ?? 0) - Math.abs(a.d ?? 0));
+
+    for (const e of effectSizes) {
+      const dStr = e.d !== null ? e.d.toFixed(3) : 'N/A';
+      const dirFlag = e.d !== null ? (e.d > 0.2 ? ' <<<' : e.d < -0.2 ? ' >>>' : '') : '';
+      console.log(`  ${e.label.padEnd(18)} ${e.avgRug.toFixed(1).padStart(8)} ${e.avgSurv.toFixed(1).padStart(8)} ${dStr.padStart(8)} ${(e.pctRug + '%').padStart(6)} ${(e.pctSurv + '%').padStart(6)} ${dirFlag}`);
+    }
+
+    console.log(`\n  Key: d > 0 means rugs have HIGHER values (more negative penalty = lower d)`);
+    console.log(`  For penalties (negative values): d < 0 means rugs are penalized MORE (good)`);
+    console.log(`  For bonuses (positive values): d < 0 means survivors get MORE bonus (good)`);
+    console.log(`  |d| > 0.8 = large, 0.5-0.8 = medium, 0.2-0.5 = small`);
+
+    // Funder fan-out special analysis (text column)
+    subheader('Funder fan-out (text signal)');
+    const rugFanOut = rugs.filter(r => r.dp_funder_fan_out && r.dp_funder_fan_out !== '' && r.dp_funder_fan_out !== 'null').length;
+    const survFanOut = survivors.filter(r => r.dp_funder_fan_out && r.dp_funder_fan_out !== '' && r.dp_funder_fan_out !== 'null').length;
+    console.log(`  Rugs with funder fan-out: ${rugFanOut}/${rugs.length} (${pct(rugFanOut, rugs.length)}%)`);
+    console.log(`  Survivors with funder fan-out: ${survFanOut}/${survivors.length} (${pct(survFanOut, survivors.length)}%)`);
+
+    // Top 3 discriminators summary
+    subheader('Top 3 Discriminating Components');
+    for (let i = 0; i < Math.min(3, effectSizes.length); i++) {
+      const e = effectSizes[i];
+      const dStr = e.d !== null ? e.d.toFixed(3) : 'N/A';
+      const direction = e.d > 0
+        ? 'rugs score higher (penalty misses rugs, or bonus gives to rugs)'
+        : 'survivors score higher (penalty catches rugs, or bonus rewards survivors)';
+      console.log(`  ${i + 1}. ${e.label} (d=${dStr}) — ${direction}`);
+      console.log(`     Rugs avg: ${e.avgRug.toFixed(1)} (${e.pctRug}% non-zero) | Surv avg: ${e.avgSurv.toFixed(1)} (${e.pctSurv}% non-zero)`);
+    }
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// SECTION: Penalty Combos
+// ═══════════════════════════════════════════════════════════════════════
+if (shouldShow('penalty_combos')) {
+  header('PENALTY COMBOS — Which combinations predict outcome? (v11o+)');
+
+  const rows = db.prepare(`
+    SELECT pool_outcome, ${PENALTY_COLS.map(p => p.col).join(', ')}
+    FROM detected_pools
+    WHERE dp_final_score IS NOT NULL AND pool_outcome IN ('rug', 'survivor')
+      AND ${versionWhereDP()}
+  `).all();
+
+  const rugs = rows.filter(r => r.pool_outcome === 'rug');
+  const survivors = rows.filter(r => r.pool_outcome === 'survivor');
+
+  if (rows.length < 10) {
+    console.log('  Not enough data.');
+  } else {
+    // Encode active signals per row
+    function getActiveSignals(row) {
+      const active = [];
+      for (const p of PENALTY_COLS) {
+        const val = row[p.col] ?? 0;
+        if (p.dir === 'penalty' && val < 0) active.push(p.label);
+        if (p.dir === 'bonus' && val > 0) active.push('+' + p.label);
+        if (p.dir === 'mixed' && val !== 0) active.push((val < 0 ? '' : '+') + p.label);
+      }
+      return active;
+    }
+
+    // Two-way penalty combos
+    subheader('Two-way penalty combos (penalties only)');
+    const comboCounts = {};
+    for (const row of rows) {
+      const penalties = getActiveSignals(row).filter(s => !s.startsWith('+'));
+      if (penalties.length < 2) continue;
+      for (let i = 0; i < penalties.length; i++) {
+        for (let j = i + 1; j < penalties.length; j++) {
+          const key = [penalties[i], penalties[j]].sort().join(' + ');
+          if (!comboCounts[key]) comboCounts[key] = { rug: 0, surv: 0 };
+          if (row.pool_outcome === 'rug') comboCounts[key].rug++;
+          else comboCounts[key].surv++;
+        }
+      }
+    }
+
+    const sortedCombos = Object.entries(comboCounts)
+      .filter(([, v]) => v.rug + v.surv >= 3)
+      .sort((a, b) => {
+        const aRate = a[1].rug / (a[1].rug + a[1].surv);
+        const bRate = b[1].rug / (b[1].rug + b[1].surv);
+        return bRate - aRate;
+      });
+
+    if (sortedCombos.length > 0) {
+      console.log(`  ${'Combo'.padEnd(35)} ${'N'.padStart(4)} ${'Rugs'.padStart(5)} ${'Surv'.padStart(5)} ${'Rug%'.padStart(6)}`);
+      console.log(`  ${'-'.repeat(58)}`);
+      for (const [combo, counts] of sortedCombos.slice(0, 15)) {
+        const total = counts.rug + counts.surv;
+        const rugRate = pct(counts.rug, total);
+        console.log(`  ${combo.padEnd(35)} ${String(total).padStart(4)} ${String(counts.rug).padStart(5)} ${String(counts.surv).padStart(5)} ${(rugRate + '%').padStart(6)}`);
+      }
+    } else {
+      console.log('  No penalty combos found with N >= 3.');
+    }
+
+    // Three-way combos
+    subheader('Three-way penalty combos (N >= 3)');
+    const triCounts = {};
+    for (const row of rows) {
+      const penalties = getActiveSignals(row).filter(s => !s.startsWith('+'));
+      if (penalties.length < 3) continue;
+      for (let i = 0; i < penalties.length; i++) {
+        for (let j = i + 1; j < penalties.length; j++) {
+          for (let k = j + 1; k < penalties.length; k++) {
+            const key = [penalties[i], penalties[j], penalties[k]].sort().join(' + ');
+            if (!triCounts[key]) triCounts[key] = { rug: 0, surv: 0 };
+            if (row.pool_outcome === 'rug') triCounts[key].rug++;
+            else triCounts[key].surv++;
+          }
+        }
+      }
+    }
+
+    const sortedTri = Object.entries(triCounts)
+      .filter(([, v]) => v.rug + v.surv >= 3)
+      .sort((a, b) => {
+        const aRate = a[1].rug / (a[1].rug + a[1].surv);
+        const bRate = b[1].rug / (b[1].rug + b[1].surv);
+        return bRate - aRate;
+      });
+
+    if (sortedTri.length > 0) {
+      console.log(`  ${'Combo'.padEnd(45)} ${'N'.padStart(4)} ${'Rugs'.padStart(5)} ${'Surv'.padStart(5)} ${'Rug%'.padStart(6)}`);
+      console.log(`  ${'-'.repeat(68)}`);
+      for (const [combo, counts] of sortedTri.slice(0, 10)) {
+        const total = counts.rug + counts.surv;
+        const rugRate = pct(counts.rug, total);
+        console.log(`  ${combo.padEnd(45)} ${String(total).padStart(4)} ${String(counts.rug).padStart(5)} ${String(counts.surv).padStart(5)} ${(rugRate + '%').padStart(6)}`);
+      }
+    } else {
+      console.log('  No 3-way combos found with N >= 3.');
+    }
+
+    // Bonus combos among survivors vs rugs
+    subheader('Bonus patterns: survivors vs rugs');
+    for (const label of ['+Graduation', '+Observation', '+Organic', '+Smart Wallet']) {
+      const rugWith = rugs.filter(r => getActiveSignals(r).includes(label)).length;
+      const survWith = survivors.filter(r => getActiveSignals(r).includes(label)).length;
+      console.log(`  ${label.padEnd(20)} Rugs: ${rugWith}/${rugs.length} (${pct(rugWith, rugs.length)}%) | Surv: ${survWith}/${survivors.length} (${pct(survWith, survivors.length)}%)`);
+    }
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// SECTION: Position Correlation
+// ═══════════════════════════════════════════════════════════════════════
+if (shouldShow('position_correlation')) {
+  header('POSITION CORRELATION — Penalties vs actual PnL (v11o+)');
+
+  const rows = db.prepare(`
+    SELECT
+      p.pnl_sol, p.pnl_pct, p.peak_multiplier, p.exit_reason,
+      ${PENALTY_COLS.map(c => 'd.' + c.col).join(', ')}
+    FROM positions p
+    JOIN detected_pools d ON p.pool_id = d.id
+    WHERE ${versionWherePos('p.bot_version')} AND d.dp_final_score IS NOT NULL
+      AND p.status IN ('stopped', 'closed')
+  `).all();
+
+  console.log(`\n  Positions with penalty breakdowns: N=${rows.length}`);
+
+  if (rows.length < 5) {
+    console.log('  Not enough data for correlation analysis.');
+  } else {
+    // Correlation of each penalty with PnL
+    subheader('Penalty correlation with PnL (Pearson r)');
+    console.log(`  ${'Component'.padEnd(18)} ${'r(PnL)'.padStart(8)} ${'r(Peak)'.padStart(8)} ${'Avg(W)'.padStart(8)} ${'Avg(L)'.padStart(8)}`);
+    console.log(`  ${'-'.repeat(55)}`);
+
+    const winners = rows.filter(r => r.pnl_sol > 0);
+    const losers = rows.filter(r => r.pnl_sol <= 0);
+
+    for (const p of PENALTY_COLS) {
+      const vals = rows.map(r => r[p.col] ?? 0);
+      const pnls = rows.map(r => r.pnl_sol);
+      const peaks = rows.map(r => r.peak_multiplier ?? 1);
+
+      const rPnl = pearsonR(vals, pnls);
+      const rPeak = pearsonR(vals, peaks);
+
+      const avgW = winners.length > 0 ? winners.reduce((s, r) => s + (r[p.col] ?? 0), 0) / winners.length : 0;
+      const avgL = losers.length > 0 ? losers.reduce((s, r) => s + (r[p.col] ?? 0), 0) / losers.length : 0;
+
+      console.log(`  ${p.label.padEnd(18)} ${(rPnl !== null ? rPnl.toFixed(3) : 'N/A').padStart(8)} ${(rPeak !== null ? rPeak.toFixed(3) : 'N/A').padStart(8)} ${avgW.toFixed(1).padStart(8)} ${avgL.toFixed(1).padStart(8)}`);
+    }
+
+    // Breakdown by exit reason
+    subheader('PnL by exit reason (positions with breakdowns)');
+    const byExit = {};
+    for (const r of rows) {
+      const reason = r.exit_reason || 'unknown';
+      if (!byExit[reason]) byExit[reason] = { n: 0, pnl: 0 };
+      byExit[reason].n++;
+      byExit[reason].pnl += r.pnl_sol;
+    }
+    for (const [reason, data] of Object.entries(byExit).sort((a, b) => b[1].n - a[1].n)) {
+      console.log(`  ${reason.padEnd(20)} N=${String(data.n).padStart(3)} | PnL: ${data.pnl >= 0 ? '+' : ''}${data.pnl.toFixed(4)} SOL`);
+    }
+
+    // Rug exits — which penalties were present?
+    const rugExits = rows.filter(r => r.exit_reason === 'rug_pull');
+    if (rugExits.length > 0) {
+      subheader(`Penalties on rug_pull positions (N=${rugExits.length})`);
+      for (const p of PENALTY_COLS) {
+        const nonZero = rugExits.filter(r => (r[p.col] ?? 0) !== 0).length;
+        const avg = rugExits.reduce((s, r) => s + (r[p.col] ?? 0), 0) / rugExits.length;
+        if (nonZero > 0) {
+          console.log(`  ${p.label.padEnd(18)} avg: ${avg.toFixed(1)} | ${nonZero}/${rugExits.length} non-zero (${pct(nonZero, rugExits.length)}%)`);
+        }
+      }
+    }
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// SECTION: Broad Features
+// ═══════════════════════════════════════════════════════════════════════
+if (shouldShow('broad_features')) {
+  header('BROAD FEATURES — All pools with outcomes (N=1,475)');
+
+  // Score bucket analysis with 5-point buckets
+  subheader('Score buckets (5-point) with rug rate');
+  const buckets = db.prepare(`
+    SELECT
+      CASE
+        WHEN security_score IS NULL THEN 'NULL'
+        WHEN security_score >= 90 THEN '90+'
+        WHEN security_score >= 85 THEN '85-89'
+        WHEN security_score >= 80 THEN '80-84'
+        WHEN security_score >= 75 THEN '75-79'
+        WHEN security_score >= 70 THEN '70-74'
+        WHEN security_score >= 65 THEN '65-69'
+        WHEN security_score >= 60 THEN '60-64'
+        WHEN security_score >= 55 THEN '55-59'
+        WHEN security_score >= 50 THEN '50-54'
+        ELSE '<50'
+      END as bucket,
+      COUNT(*) as n,
+      SUM(CASE WHEN pool_outcome = 'rug' THEN 1 ELSE 0 END) as rugs,
+      SUM(CASE WHEN pool_outcome = 'survivor' THEN 1 ELSE 0 END) as survivors
+    FROM detected_pools
+    WHERE pool_outcome IN ('rug', 'survivor')
+    GROUP BY bucket
+    ORDER BY MIN(COALESCE(security_score, -1)) DESC
+  `).all();
+
+  console.log(`  ${'Score'.padEnd(8)} ${'Total'.padStart(6)} ${'Rugs'.padStart(6)} ${'Surv'.padStart(6)} ${'Rug%'.padStart(7)} ${'Bar'}`);
+  console.log(`  ${'-'.repeat(55)}`);
+  for (const b of buckets) {
+    const rugRate = b.n > 0 ? (b.rugs / b.n) * 100 : 0;
+    const bar = '#'.repeat(Math.round(rugRate / 2));
+    console.log(`  ${b.bucket.padEnd(8)} ${String(b.n).padStart(6)} ${String(b.rugs).padStart(6)} ${String(b.survivors).padStart(6)} ${(rugRate.toFixed(1) + '%').padStart(7)} ${bar}`);
+  }
+
+  // Feature analysis on all pools with outcomes
+  subheader('Feature averages: Rugs vs Survivors (all pools)');
+  const featureRows = db.prepare(`
+    SELECT
+      pool_outcome,
+      dp_liquidity_usd, dp_holder_count, dp_top_holder_pct,
+      dp_rugcheck_score, dp_honeypot_verified, dp_lp_burned,
+      security_score
+    FROM detected_pools
+    WHERE pool_outcome IN ('rug', 'survivor')
+  `).all();
+
+  const rugFeats = featureRows.filter(r => r.pool_outcome === 'rug');
+  const survFeats = featureRows.filter(r => r.pool_outcome === 'survivor');
+
+  const features = [
+    { col: 'security_score', label: 'Security Score' },
+    { col: 'dp_liquidity_usd', label: 'Liquidity USD' },
+    { col: 'dp_holder_count', label: 'Holder Count' },
+    { col: 'dp_top_holder_pct', label: 'Top Holder %' },
+    { col: 'dp_rugcheck_score', label: 'RugCheck Score' },
+  ];
+
+  console.log(`  ${'Feature'.padEnd(18)} ${'AvgRug'.padStart(10)} ${'AvgSurv'.padStart(10)} ${'Cohen d'.padStart(8)} ${'N(valid)'.padStart(10)}`);
+  console.log(`  ${'-'.repeat(60)}`);
+
+  for (const f of features) {
+    const rVals = rugFeats.map(r => r[f.col]).filter(v => v != null);
+    const sVals = survFeats.map(r => r[f.col]).filter(v => v != null);
+    const avgR = rVals.length > 0 ? rVals.reduce((s, v) => s + v, 0) / rVals.length : 0;
+    const avgS = sVals.length > 0 ? sVals.reduce((s, v) => s + v, 0) / sVals.length : 0;
+    const d = cohensD(rVals, sVals);
+    const nValid = rVals.length + sVals.length;
+    console.log(`  ${f.label.padEnd(18)} ${avgR.toFixed(1).padStart(10)} ${avgS.toFixed(1).padStart(10)} ${(d !== null ? d.toFixed(3) : 'N/A').padStart(8)} ${String(nValid).padStart(10)}`);
+  }
+
+  // Optimal threshold analysis
+  subheader('Optimal score threshold analysis');
+  const threshRows = db.prepare(`
+    SELECT security_score, pool_outcome
+    FROM detected_pools
+    WHERE pool_outcome IN ('rug', 'survivor') AND security_score IS NOT NULL
+    ORDER BY security_score
+  `).all();
+
+  if (threshRows.length > 0) {
+    const totalSurvs = threshRows.filter(r => r.pool_outcome === 'survivor').length;
+    console.log(`  ${'Threshold'.padEnd(12)} ${'Pass'.padStart(6)} ${'Rugs'.padStart(6)} ${'Surv'.padStart(6)} ${'Rug%'.padStart(7)} ${'SurvLost'.padStart(9)}`);
+    console.log(`  ${'-'.repeat(50)}`);
+    for (const thresh of [60, 65, 70, 75, 80, 85]) {
+      const passing = threshRows.filter(r => r.security_score >= thresh);
+      const passingRugs = passing.filter(r => r.pool_outcome === 'rug').length;
+      const passingSurvs = passing.filter(r => r.pool_outcome === 'survivor').length;
+      const survLost = totalSurvs - passingSurvs;
+      const rugRate = passing.length > 0 ? (passingRugs / passing.length) * 100 : 0;
+      console.log(`  ${('>=' + thresh).padEnd(12)} ${String(passing.length).padStart(6)} ${String(passingRugs).padStart(6)} ${String(passingSurvs).padStart(6)} ${(rugRate.toFixed(1) + '%').padStart(7)} ${String(survLost).padStart(9)}`);
+    }
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// SECTION: Rejection Analysis
+// ═══════════════════════════════════════════════════════════════════════
+if (shouldShow('rejection_analysis')) {
+  header('REJECTION ANALYSIS — Rugs that escaped & Survivors we blocked (v11o+)');
+
+  // Rugs that PASSED security (they got through)
+  subheader('Rugs that passed security (escaped)');
+  const escapedRugs = db.prepare(`
+    SELECT
+      substr(base_mint, 1, 8) as token, dp_final_score as score,
+      ${PENALTY_COLS.map(p => p.col).join(', ')}
+    FROM detected_pools
+    WHERE ${versionWhereDP()} AND security_passed = 1 AND pool_outcome = 'rug'
+      AND dp_final_score IS NOT NULL
+    ORDER BY dp_final_score DESC
+  `).all();
+
+  if (escapedRugs.length > 0) {
+    console.log(`  ${escapedRugs.length} rugs passed security checks:`);
+    console.log(`  ${'Token'.padEnd(10)} ${'Score'.padStart(6)} ${'Active penalties/bonuses'}`);
+    console.log(`  ${'-'.repeat(68)}`);
+    for (const r of escapedRugs.slice(0, 20)) {
+      const active = [];
+      for (const p of PENALTY_COLS) {
+        const val = r[p.col] ?? 0;
+        if (val !== 0) active.push(`${p.label}:${val}`);
+      }
+      console.log(`  ${r.token.padEnd(10)} ${String(r.score).padStart(6)} ${(active.join(', ') || 'none')}`);
+    }
+
+    // Aggregate: which penalties are MISSING on escaped rugs?
+    subheader('Penalty gaps — what WASN\'T applied to escaped rugs?');
+    for (const p of PENALTY_COLS) {
+      if (p.dir === 'bonus') continue;
+      const applied = escapedRugs.filter(r => (r[p.col] ?? 0) < 0).length;
+      const notApplied = escapedRugs.length - applied;
+      if (notApplied > 0) {
+        console.log(`  ${p.label.padEnd(18)} NOT applied: ${notApplied}/${escapedRugs.length} (${pct(notApplied, escapedRugs.length)}%)`);
+      }
+    }
+  } else {
+    console.log('  No escaped rugs found with breakdown data.');
+  }
+
+  // Survivors that were REJECTED (false positives of the filter)
+  subheader('Survivors rejected (missed winners)');
+  const blockedSurvivors = db.prepare(`
+    SELECT
+      substr(base_mint, 1, 8) as token, dp_final_score as score,
+      dp_rejection_stage as stage,
+      ${PENALTY_COLS.map(p => p.col).join(', ')}
+    FROM detected_pools
+    WHERE ${versionWhereDP()} AND security_passed = 0 AND pool_outcome = 'survivor'
+      AND dp_final_score IS NOT NULL
+    ORDER BY dp_final_score DESC
+  `).all();
+
+  if (blockedSurvivors.length > 0) {
+    console.log(`  ${blockedSurvivors.length} survivors were rejected:`);
+    console.log(`  ${'Token'.padEnd(10)} ${'Score'.padStart(6)} ${'Stage'.padEnd(20)} ${'Key penalties'}`);
+    console.log(`  ${'-'.repeat(78)}`);
+    for (const r of blockedSurvivors.slice(0, 20)) {
+      const active = [];
+      for (const p of PENALTY_COLS) {
+        const val = r[p.col] ?? 0;
+        if (val < 0) active.push(`${p.label}:${val}`);
+      }
+      console.log(`  ${r.token.padEnd(10)} ${String(r.score).padStart(6)} ${(r.stage || '?').padEnd(20)} ${active.join(', ') || 'none'}`);
+    }
+
+    // What penalty blocked them most?
+    subheader('Which penalties blocked the most survivors?');
+    const blockReasons = {};
+    for (const r of blockedSurvivors) {
+      for (const p of PENALTY_COLS) {
+        const val = r[p.col] ?? 0;
+        if (val < 0) {
+          blockReasons[p.label] = (blockReasons[p.label] || 0) + 1;
+        }
+      }
+    }
+    const sorted = Object.entries(blockReasons).sort((a, b) => b[1] - a[1]);
+    for (const [label, count] of sorted) {
+      console.log(`  ${label.padEnd(18)} ${count} survivors blocked (${pct(count, blockedSurvivors.length)}%)`);
+    }
+  } else {
+    console.log('  No rejected survivors found.');
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// SECTION: ML Readiness
+// ═══════════════════════════════════════════════════════════════════════
+if (shouldShow('ml_readiness')) {
+  header('ML READINESS ASSESSMENT');
+
+  subheader('Dataset sizes');
+  const counts = {
+    breakdownsWithOutcome: db.prepare(`SELECT COUNT(*) as n FROM detected_pools WHERE dp_final_score IS NOT NULL AND pool_outcome IN ('rug', 'survivor') AND ${versionWhereDP()}`).get().n,
+    allWithOutcome: db.prepare(`SELECT COUNT(*) as n FROM detected_pools WHERE pool_outcome IN ('rug', 'survivor')`).get().n,
+    positions: db.prepare(`SELECT COUNT(*) as n FROM positions WHERE status IN ('stopped', 'closed')`).get().n,
+    shadowBroken: db.prepare(`SELECT COUNT(*) as n FROM shadow_positions WHERE total_polls = 0`).get().n,
+    shadowWorking: db.prepare(`SELECT COUNT(*) as n FROM shadow_positions WHERE total_polls > 0`).get().n,
+  };
+
+  console.log(`  Breakdowns + outcome (v11o+):  ${counts.breakdownsWithOutcome}`);
+  console.log(`  All pools with outcome:         ${counts.allWithOutcome}`);
+  console.log(`  Positions (traded):             ${counts.positions}`);
+  console.log(`  Shadow (broken, 0 polls):       ${counts.shadowBroken}`);
+  console.log(`  Shadow (working, >0 polls):     ${counts.shadowWorking}`);
+
+  // Class balance
+  subheader('Class balance');
+  const balance = db.prepare(`
+    SELECT pool_outcome, COUNT(*) as n
+    FROM detected_pools WHERE pool_outcome IN ('rug', 'survivor')
+    GROUP BY pool_outcome
+  `).all();
+  for (const b of balance) {
+    console.log(`  ${b.pool_outcome}: ${b.n}`);
+  }
+  const rugN = balance.find(b => b.pool_outcome === 'rug')?.n || 0;
+  const survN = balance.find(b => b.pool_outcome === 'survivor')?.n || 0;
+  const ratio = survN > 0 ? (rugN / survN).toFixed(2) : 'inf';
+  console.log(`  Rug:Survivor ratio: ${ratio}:1`);
+
+  // Feature coverage (breakdown dataset)
+  subheader('Feature coverage (v11o+ breakdowns)');
+  const breakdownCount = counts.breakdownsWithOutcome;
+  for (const p of PENALTY_COLS) {
+    const nulls = db.prepare(`
+      SELECT SUM(CASE WHEN ${p.col} IS NULL THEN 1 ELSE 0 END) as n
+      FROM detected_pools
+      WHERE dp_final_score IS NOT NULL AND pool_outcome IN ('rug', 'survivor') AND ${versionWhereDP()}
+    `).get().n;
+    const coverage = pct(breakdownCount - nulls, breakdownCount);
+    const flag = parseFloat(coverage) < 90 ? ' WARNING' : '';
+    console.log(`  ${p.label.padEnd(18)} ${coverage}% coverage${flag}`);
+  }
+
+  // Feature coverage for broad features
+  const broadFeatures = ['dp_liquidity_usd', 'dp_holder_count', 'dp_top_holder_pct', 'dp_rugcheck_score', 'dp_lp_burned'];
+  subheader('Feature coverage (all pools with outcomes)');
+  const totalWithOutcome = counts.allWithOutcome;
+  for (const col of broadFeatures) {
+    const nonNull = db.prepare(`
+      SELECT COUNT(*) as n FROM detected_pools
+      WHERE pool_outcome IN ('rug', 'survivor') AND ${col} IS NOT NULL
+    `).get().n;
+    console.log(`  ${col.replace('dp_', '').padEnd(20)} ${pct(nonNull, totalWithOutcome)}% (${nonNull}/${totalWithOutcome})`);
+  }
+
+  // Recommendations
+  subheader('ML Recommendations');
+  console.log(`  1. DATASET:  ${counts.breakdownsWithOutcome} breakdown samples (v11o+) — ${counts.breakdownsWithOutcome >= 100 ? 'sufficient for tree models' : 'marginal'}`);
+  console.log(`     - DecisionTree (depth 3-4): OK with 100+ samples`);
+  console.log(`     - Random Forest: OK with 200+ samples`);
+  console.log(`     - Gradient Boosting: Needs 500+ ideally`);
+
+  if (counts.breakdownsWithOutcome >= 100) {
+    console.log(`\n  2. ACTION: TRAIN NOW with breakdown features (N=${counts.breakdownsWithOutcome})`);
+    console.log(`     - Use DecisionTree or small RandomForest (max_depth=3)`);
+    console.log(`     - 5-fold stratified cross-validation`);
+    console.log(`     - Class weight: balanced (${ratio}:1 imbalance)`);
+  } else {
+    console.log(`\n  2. ACTION: WAIT — need at least 100 samples with breakdowns`);
+    console.log(`     - Currently: ${counts.breakdownsWithOutcome}`);
+  }
+
+  console.log(`\n  3. SHADOW FIX: Fixing shadow outcomes would unlock ~${counts.shadowBroken} labels`);
+  console.log(`     - These have pool_id -> can JOIN to detected_pools.pool_outcome`);
+  console.log(`     - No penalty breakdowns though — useful for broad feature models only`);
+
+  console.log(`\n  4. BROAD MODEL: ${counts.allWithOutcome} pools with outcomes + basic features`);
+  console.log(`     - Can train on security_score, liquidity, holders, rugcheck_score`);
+  console.log(`     - Good baseline to compare against breakdown-enhanced model`);
+}
 
 db.close();
-console.log('\nAnalysis complete.');
+console.log('\n');

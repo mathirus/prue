@@ -273,6 +273,8 @@ function initSchema(database: Database.Database): void {
     `ALTER TABLE detected_pools ADD COLUMN dp_fast_score INTEGER`,
     `ALTER TABLE detected_pools ADD COLUMN dp_deferred_delta INTEGER`,
     `ALTER TABLE detected_pools ADD COLUMN dp_final_score INTEGER`,
+    // v11r: Funder fan-out detection data (JSON blob)
+    `ALTER TABLE detected_pools ADD COLUMN dp_funder_fan_out TEXT`,
     // v11o: Post-buy HHI tracking — validate if HHI delta predicts outcomes
     `ALTER TABLE positions ADD COLUMN hhi_entry REAL`,
     `ALTER TABLE positions ADD COLUMN hhi_60s REAL`,
@@ -285,6 +287,8 @@ function initSchema(database: Database.Database): void {
     // v11o-data: buy_count in position_price_log for buy/sell ratio time-series
     `ALTER TABLE position_price_log ADD COLUMN buy_count INTEGER DEFAULT 0`,
     `ALTER TABLE position_price_log ADD COLUMN cumulative_sell_count INTEGER DEFAULT 0`,
+    // v11y: Network rug penalty tracking
+    `ALTER TABLE detected_pools ADD COLUMN dp_network_rug_penalty INTEGER`,
   ];
   for (const sql of migrations) {
     try { database.exec(sql); } catch { /* column already exists */ }
@@ -299,6 +303,12 @@ function initSchema(database: Database.Database): void {
       added_at INTEGER DEFAULT (unixepoch('now') * 1000)
     );
     CREATE INDEX IF NOT EXISTS idx_token_creators_funding ON token_creators(funding_source);
+  `);
+
+  // v11y: Indexes for network rug history lookups (JOIN token_creators ↔ detected_pools)
+  database.exec(`
+    CREATE INDEX IF NOT EXISTS idx_detected_pools_base_mint ON detected_pools(base_mint);
+    CREATE INDEX IF NOT EXISTS idx_detected_pools_outcome ON detected_pools(pool_outcome);
   `);
 
   // v8q: Post-trade price checks at short intervals
@@ -429,6 +439,32 @@ function initSchema(database: Database.Database): void {
     database.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_shadow_token_unique ON shadow_positions(token_mint)`);
   } catch { /* index already exists */ }
 
+  // v11s: TP1 snapshot data collection — signals at the moment of TP1 hit + post-TP1 outcome
+  database.exec(`
+    CREATE TABLE IF NOT EXISTS tp1_snapshots (
+      position_id TEXT PRIMARY KEY,
+      token_mint TEXT NOT NULL,
+      time_to_tp1_ms INTEGER,
+      entry_reserve_lamports REAL,
+      tp1_reserve_lamports REAL,
+      reserve_change_pct REAL,
+      buy_count_30s INTEGER DEFAULT 0,
+      sell_count_15s INTEGER DEFAULT 0,
+      buy_sell_ratio REAL,
+      cumulative_sell_count INTEGER DEFAULT 0,
+      current_multiplier REAL,
+      smart_tp_decision TEXT,
+      smart_tp_signals_passed INTEGER,
+      smart_tp_reason TEXT,
+      post_tp1_peak REAL,
+      post_tp1_exit_reason TEXT,
+      post_tp1_duration_ms INTEGER,
+      bot_version TEXT,
+      created_at INTEGER DEFAULT (unixepoch('now') * 1000)
+    );
+    CREATE INDEX IF NOT EXISTS idx_tp1_snapshots_mint ON tp1_snapshots(token_mint);
+  `);
+
   // v8p: Real balance tracking
   database.exec(`
     CREATE TABLE IF NOT EXISTS balance_snapshots (
@@ -441,5 +477,38 @@ function initSchema(database: Database.Database): void {
       created_at INTEGER DEFAULT (unixepoch('now') * 1000)
     );
     CREATE INDEX IF NOT EXISTS idx_balance_snapshots_created ON balance_snapshots(created_at);
+  `);
+
+  // v7 ML pipeline: model registry + prediction tracking
+  database.exec(`
+    CREATE TABLE IF NOT EXISTS ml_models (
+      model_id TEXT PRIMARY KEY,
+      model_type TEXT NOT NULL,
+      trained_at INTEGER NOT NULL,
+      training_samples INTEGER,
+      cv_f1 REAL,
+      temporal_f1 REAL,
+      feature_names TEXT,
+      feature_importances TEXT,
+      model_path TEXT,
+      is_active INTEGER DEFAULT 0,
+      notes TEXT
+    );
+
+    CREATE TABLE IF NOT EXISTS ml_predictions (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      pool_address TEXT NOT NULL,
+      token_mint TEXT NOT NULL,
+      model_id TEXT NOT NULL,
+      prediction TEXT NOT NULL,
+      confidence REAL NOT NULL,
+      actual_outcome TEXT,
+      features TEXT,
+      was_blocked INTEGER DEFAULT 0,
+      predicted_at INTEGER NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_ml_predictions_pool ON ml_predictions(pool_address);
+    CREATE INDEX IF NOT EXISTS idx_ml_predictions_mint ON ml_predictions(token_mint);
+    CREATE INDEX IF NOT EXISTS idx_ml_predictions_model ON ml_predictions(model_id);
   `);
 }

@@ -394,6 +394,32 @@ export class TradeLogger {
   }
 
   /**
+   * v11r: Save funder fan-out detection data on a pool record.
+   */
+  updateFunderFanOut(poolId: string, fanOut: { detected: boolean; recentTxCount: number; uniformAmountSol: number }): void {
+    try {
+      const db = getDb();
+      db.prepare('UPDATE detected_pools SET dp_funder_fan_out = ? WHERE id = ?')
+        .run(JSON.stringify(fanOut), poolId);
+    } catch (err) {
+      logger.debug(`[trade-logger] Failed to update funder fan-out: ${err}`);
+    }
+  }
+
+  /**
+   * v11y: Save network rug penalty on a pool record.
+   */
+  updateNetworkRugPenalty(poolId: string, penalty: number): void {
+    try {
+      const db = getDb();
+      db.prepare('UPDATE detected_pools SET dp_network_rug_penalty = ? WHERE id = ?')
+        .run(penalty, poolId);
+    } catch (err) {
+      logger.debug(`[trade-logger] Failed to update network rug penalty: ${err}`);
+    }
+  }
+
+  /**
    * Record why a token was rejected (for post-hoc analysis of false negatives).
    */
   updateRejectionReasons(poolId: string, reasons: string): void {
@@ -543,6 +569,102 @@ export class TradeLogger {
       SELECT balance_sol, event, token_mint, pnl_sol, bot_version, created_at
       FROM balance_snapshots ORDER BY created_at DESC LIMIT ?
     `).all(limit) as Array<Record<string, unknown>>;
+  }
+
+  // ─── v11s: TP1 snapshot methods ──────────────────────────────────────
+
+  /**
+   * v11s: Capture signals at the moment TP1 is hit for smart TP analysis.
+   */
+  logTp1Snapshot(data: {
+    positionId: string;
+    tokenMint: string;
+    timeToTp1Ms: number;
+    entryReserveLamports: number | null;
+    tp1ReserveLamports: number | null;
+    reserveChangePct: number | null;
+    buyCount30s: number;
+    sellCount15s: number;
+    buySellRatio: number;
+    cumulativeSellCount: number;
+    currentMultiplier: number;
+    smartTpDecision?: string;
+    smartTpSignalsPassed?: number;
+    smartTpReason?: string;
+  }): void {
+    try {
+      const db = getDb();
+      db.prepare(`
+        INSERT OR REPLACE INTO tp1_snapshots
+        (position_id, token_mint, time_to_tp1_ms, entry_reserve_lamports, tp1_reserve_lamports,
+         reserve_change_pct, buy_count_30s, sell_count_15s, buy_sell_ratio,
+         cumulative_sell_count, current_multiplier,
+         smart_tp_decision, smart_tp_signals_passed, smart_tp_reason,
+         bot_version)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(
+        data.positionId,
+        data.tokenMint,
+        data.timeToTp1Ms,
+        data.entryReserveLamports,
+        data.tp1ReserveLamports,
+        data.reserveChangePct,
+        data.buyCount30s,
+        data.sellCount15s,
+        data.buySellRatio,
+        data.cumulativeSellCount,
+        data.currentMultiplier,
+        data.smartTpDecision ?? null,
+        data.smartTpSignalsPassed ?? null,
+        data.smartTpReason ?? null,
+        BOT_VERSION,
+      );
+    } catch (err) {
+      logger.debug(`[trade-logger] Failed to log TP1 snapshot: ${err}`);
+    }
+  }
+
+  /**
+   * v11s: Update TP1 snapshot with post-close outcome data.
+   */
+  updateTp1Outcome(positionId: string, peak: number, exitReason: string, durationMs: number): void {
+    try {
+      const db = getDb();
+      db.prepare(`
+        UPDATE tp1_snapshots SET
+          post_tp1_peak = ?,
+          post_tp1_exit_reason = ?,
+          post_tp1_duration_ms = ?
+        WHERE position_id = ?
+      `).run(peak, exitReason, durationMs, positionId);
+    } catch (err) {
+      logger.debug(`[trade-logger] Failed to update TP1 outcome: ${err}`);
+    }
+  }
+
+  /**
+   * v11s: Check if a position has a TP1 snapshot (used for outcome tracking on close).
+   */
+  hasTp1Snapshot(positionId: string): boolean {
+    try {
+      const db = getDb();
+      const row = db.prepare('SELECT 1 FROM tp1_snapshots WHERE position_id = ? LIMIT 1').get(positionId);
+      return !!row;
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * v11s: Get TP1 snapshot for shadow analysis on position close.
+   */
+  getTp1Snapshot(positionId: string): Record<string, unknown> | undefined {
+    try {
+      const db = getDb();
+      return db.prepare('SELECT * FROM tp1_snapshots WHERE position_id = ?').get(positionId) as Record<string, unknown> | undefined;
+    } catch {
+      return undefined;
+    }
   }
 
   // ─── v9a: Shadow mode methods ────────────────────────────────────────
@@ -760,6 +882,36 @@ export class TradeLogger {
       }
     } catch (err) {
       logger.debug(`[trade-logger] Failed to save pool outcome check: ${err}`);
+    }
+  }
+
+  /**
+   * v11t: Backfill shadow position outcomes from detected_pools.pool_outcome.
+   * In data-only mode, shadow positions never get price updates, so rug_detected/tp1_hit
+   * are always 0. This syncs the rug label from DexScreener outcome checks.
+   * Returns number of rows updated.
+   */
+  backfillShadowOutcomes(): number {
+    try {
+      const db = getDb();
+      const result = db.prepare(`
+        UPDATE shadow_positions SET
+          rug_detected = CASE WHEN dp.pool_outcome = 'rug' THEN 1 ELSE 0 END,
+          exit_reason = CASE
+            WHEN dp.pool_outcome = 'rug' THEN 'rug_backfill'
+            WHEN dp.pool_outcome = 'survivor' THEN 'survivor_backfill'
+            ELSE exit_reason
+          END
+        FROM detected_pools dp
+        WHERE shadow_positions.pool_id = dp.id
+          AND dp.pool_outcome IN ('rug', 'survivor')
+          AND shadow_positions.total_polls = 0
+          AND shadow_positions.exit_reason NOT IN ('rug_backfill', 'survivor_backfill')
+      `).run();
+      return result.changes;
+    } catch (err) {
+      logger.error(`[trade-logger] Failed to backfill shadow outcomes: ${err}`);
+      return 0;
     }
   }
 

@@ -53,7 +53,6 @@ export function scheduleMissedGainsCheck(
   positionId: string,
   entryPrice: number,
   closedAt: number,
-  sellPriceNative?: number,
 ): void {
   // GeckoTerminal OHLCV checks at 1h/4h
   for (const delay of CHECK_DELAYS_MS) {
@@ -73,7 +72,7 @@ export function scheduleMissedGainsCheck(
     const label = minutes >= 60 ? `${minutes / 60}h` : `${minutes}min`;
     setTimeout(async () => {
       try {
-        await shortIntervalCheck(tokenMint, positionId, label, minutes, sellPriceNative);
+        await shortIntervalCheck(tokenMint, positionId, label, minutes);
       } catch (err) {
         logger.debug(`[post-trade] Error @${label} for ${positionId.slice(0, 8)}: ${err}`);
       }
@@ -92,7 +91,6 @@ async function shortIntervalCheck(
   positionId: string,
   label: string,
   delayMinutes: number,
-  sellPriceNative?: number,
 ): Promise<void> {
   const DEXSCREENER_TOKEN = 'https://api.dexscreener.com/latest/dex/tokens';
 
@@ -112,7 +110,7 @@ async function shortIntervalCheck(
       // Token dead — save that fact
       savePostTradeCheck(positionId, tokenMint, label, delayMinutes, {
         priceNative: 0, marketCap: 0, liq: 0, vol: 0, txns: 0, alive: false,
-      }, sellPriceNative);
+      });
       return;
     }
 
@@ -125,7 +123,7 @@ async function shortIntervalCheck(
 
     savePostTradeCheck(positionId, tokenMint, label, delayMinutes, {
       priceNative, marketCap, liq, vol, txns, alive: true,
-    }, sellPriceNative);
+    });
 
     const mcapStr = marketCap > 1000000 ? `$${(marketCap / 1e6).toFixed(1)}M` : `$${Math.round(marketCap / 1000)}K`;
     logger.info(
@@ -142,15 +140,22 @@ function savePostTradeCheck(
   label: string,
   delayMinutes: number,
   data: { priceNative: number; marketCap: number; liq: number; vol: number; txns: number; alive: boolean },
-  sellPriceNative?: number,
 ): void {
   try {
     const db = getDb();
 
-    // Calculate multipliers if we have sell price
+    // Compute multiplier vs first check (2min baseline) — same DexScreener units, no mismatch
     let multVsSell: number | null = null;
-    if (sellPriceNative && sellPriceNative > 0 && data.priceNative > 0) {
-      multVsSell = data.priceNative / sellPriceNative;
+    if (data.priceNative > 0) {
+      const first = db.prepare(
+        `SELECT price_native FROM post_trade_checks
+         WHERE position_id = ? AND price_native > 0
+         ORDER BY delay_minutes ASC LIMIT 1`
+      ).get(positionId) as { price_native: number } | undefined;
+
+      if (first && first.price_native > 0) {
+        multVsSell = data.priceNative / first.price_native;
+      }
     }
 
     db.prepare(`

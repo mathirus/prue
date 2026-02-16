@@ -102,9 +102,12 @@ solana-sniper-bot/
 │   ├── export-training-data.cjs # (v8) Exporta CSV para ML training
 │   ├── train-classifier.py      # (v8) Entrena decision tree, genera TypeScript
 │   ├── analyze-patterns.cjs     # Analiza patrones en trades historicos
+│   ├── analyze-v11o.cjs         # ⭐ Análisis v11o+ (overview, trades, exits, funnel, shadow, timing)
 │   └── check-db.cjs             # Inspecciona estado de la DB
 ├── data/
 │   ├── bot.db                   # SQLite database principal
+│   └── backups/                 # Backups de DB y logs (NO BORRAR)
+│       └── pre-v11o-20260215/   # Backup completo antes de v11o baseline
 │   ├── baseline-metrics.json    # (v8) Snapshot de metricas pre-v8
 │   └── training-data.csv        # (v8) Datos exportados para ML
 ├── memory/                      # Documentacion de investigacion
@@ -184,6 +187,15 @@ npx ts-node scripts/check-balance.ts    # Ver balance
 node scripts/close-empty-accounts.cjs   # Cerrar ATAs vacias (recuperar rent)
 node scripts/check-db.cjs               # Inspeccionar estado de la DB
 node scripts/analyze-patterns.cjs       # Analizar patrones historicos
+
+# v11o+ Análisis (baseline desde v11o)
+node scripts/analyze-v11o.cjs                        # ⭐ Reporte completo desde v11o
+node scripts/analyze-v11o.cjs --version v11p          # Filtrar a una versión específica
+node scripts/analyze-v11o.cjs --since 2h              # Últimas 2 horas
+node scripts/analyze-v11o.cjs --section trades        # Solo sección trades
+node scripts/analyze-v11o.cjs --section overview      # Solo overview por versión
+node scripts/analyze-v11o.cjs --csv                   # Exportar trades como CSV
+# Secciones: overview, trades, exits, scores, funnel, outcomes, shadow, timing, penalties
 
 # v8: Metricas y ML
 node scripts/snapshot-baseline.cjs          # Capturar metricas baseline
@@ -353,6 +365,40 @@ detection:
 
 ---
 
+## Backups y Baseline de Datos
+
+### Baseline: v11o (2026-02-15)
+Desde v11o se considera el "punto cero" para análisis de rendimiento. La DB principal (`data/bot.db`) **solo contiene datos v11o+**. Los datos anteriores (v11i-v11n) fueron movidos al archivo backup y eliminados de la DB principal el 2026-02-16.
+
+### DB principal: `data/bot.db` (solo v11o+)
+- **Desde**: 2026-02-15 14:26:47 UTC (primer trade v11o)
+- **Contenido**: Solo datos v11o en adelante
+- **Limpieza**: 2026-02-16 — se eliminaron 45 positions, 3550 detected_pools, 315 trades, 3330 shadow_positions, 4472 pool_outcome_checks pre-v11o
+- **Razón**: Los datos pre-v11o distorsionaban análisis (sell failures de v11j/v11k aparecían como problemas actuales)
+
+### Archivo histórico: `data/backups/pre-v11o-20260215/`
+- **Ubicación**: `data/backups/pre-v11o-20260215/bot.db`
+- **Contenido**: bot.db (5MB) con TODA la data histórica, sniper-out.log (9.3MB), sniper-error.log (4.1KB)
+- **Fecha**: 2026-02-15 17:17 UTC
+- **IMPORTANTE: NO BORRAR** — es el único respaldo de data pre-v11o
+- Row counts: 84 positions, 3877 detected_pools, 389 trades, 1455 token_creators, 899 token_analysis, 3653 shadow_positions, 4747 pool_outcome_checks
+- Cubre versiones: v11i (3), v11j (6), v11k (18), v11l (12), v11m (4), v11n (2), v11o (35), v11p (5 early)
+- Para consultar: `sqlite3 data/backups/pre-v11o-20260215/bot.db "SELECT ..."`
+
+### Script de Análisis: `scripts/analyze-v11o.cjs`
+Script principal para analizar rendimiento desde v11o en adelante. Secciones:
+- **overview**: PnL y win rate por versión
+- **trades**: Lista detallada de cada trade con score, PnL, peak, exit reason
+- **exits**: Breakdown por exit reason con PnL
+- **scores**: Distribución de trades por bucket de score
+- **funnel**: Cuántos pools se detectaron vs pasaron vs compraron, rejection stages
+- **outcomes**: Pools rechazados que crecieron a $20K+ (missed winners)
+- **shadow**: Shadow positions con TP/SL/rug tracking
+- **timing**: Latencia de entrada, duración, PnL por bucket de tiempo
+- **penalties**: Promedio de cada penalty/bonus del scoring
+
+---
+
 ## Hallazgos Criticos del Bot (LEER SIEMPRE)
 
 Estos son descubrimientos validados con datos reales que guían todas las decisiones del bot.
@@ -444,6 +490,46 @@ Estos son descubrimientos validados con datos reales que guían todas las decisi
   - **WS diagnostic**: Agregar contador de mensajes por suscripción logueado cada 10s
 - **Resultado**: CPU estable en **10-11%** (era 90%), CERO event loop lags (era 2-3s), CERO FETCH TIMEOUTs, TP1 sell en **3044ms** (era 16s+ timeout). MSG rate se mantiene a 400-500/s estable (antes colapsaba a 127/s).
 - **Leccion**: NUNCA poner operaciones O(n) en callbacks que corren cientos de veces por segundo. Los WS callbacks de programas Solana populares reciben 500+ msgs/s — todo lo que no sea O(1) se amplifica 500x.
+
+---
+
+### 12. Funder Fan-Out Pattern (Sybil Pre-Funding) (v11r)
+- Scammers pre-fund 10-50 sybil wallets with 5-25 SOL each before token launch
+- These wallets "buy" the token to simulate organic activity, then creator rugs
+- 75% of rug funders (9/12) showed fan-out, vs 60% of winner funders (3/5) — but KEY discriminator is amount per wallet
+- **Scammers**: ≥5 SOL uniform to ≥10 wallets → 100% rug (6/6 funders)
+- **Legit**: 0.5-1 SOL per wallet → mixed outcomes
+- Detection: getSignaturesForAddress(funder, limit:50), count TXs in 5min, verify transfer amount
+- v11r: penalty -25 (kills any PumpSwap pool) when 15+ TXs in 5min with ≥5 SOL uniform transfers
+- 0 false positives at this threshold (N=17 funders analyzed)
+- **Leccion**: On-chain funding patterns are harder to fake than token metadata
+
+---
+
+### 13. Smart TP1 — Rugs SI Alcanzan TP1 (v11s)
+- **59.5% de rugs (22/37) alcanzaron 1.08x** antes de morir (analisis historico completo, no solo v11o+)
+- Caso 3TKaYTEV: subio a 2.83x con reserves growing antes de rug — "saludable" por todas las senales
+- **EV del hold parcial es NEGATIVO** (-0.0004 SOL/trade estimado) — los rugs post-TP1 destruyen la porcion retenida
+- Smart TP shadow implementado en v11s (`smart_tp.enabled: false`): loguea decision pero sigue vendiendo 100%
+- Tabla `tp1_snapshots` recolecta senales en cada TP1 hit para validar hipotesis
+- **NO ACTIVAR sin N>=50 snapshots y EV positivo validado con datos reales**
+- Prioridad real: sell reliability en TP1 (caso FtnWkqsa: 7 sell attempts, 0 SOL recuperado)
+- **Leccion**: La intuicion "si llego a TP1 es sano" es falsa. Mas de la mitad de los rugs pasan TP1.
+
+### 14. v11z TP Split + Post-Sell Bug Fix (2026-02-16) — MONITOREAR
+- **v11y**: Fixed `multiplier_vs_sell` bug in `post_trade_checks` — was 1,000,000x off (unit mismatch: internal SOL/base_unit vs DexScreener SOL/token). Now uses 2min check as baseline. 642 rows backfilled.
+- **v11z**: TP1 sell 50% at 1.20x, TP2 sell 100% at 1.30x (was: 100% at 1.20x)
+- **Data backing (N=125 trades, N=55 TP hits)**:
+  - 0/18 rugs reach 1.20x → everything at TP is genuine winner
+  - 49% of TP winners continue growing post-sell (with liq >$5K)
+  - 16% moonshot (2x+), 16% grew 1.5-2x, 16% grew 1.2-1.5x, 51% died
+  - Trailing stop ya era 10% (v9d), post-TP1 es 8% (stop-loss.ts)
+- **EVALUAR v11z vs v11x/v11y**:
+  - Comparar PnL promedio por trade
+  - Buscar `tp_levels_hit = '[0,1]'` (ambos TP) vs `'[0]'` (solo TP1)
+  - **Red flag**: si >60% de held portions se pierden → revertir a 100%
+  - Query: `SELECT bot_version, exit_reason, pnl_pct, tp_levels_hit FROM positions WHERE bot_version IN ('v11x','v11y','v11z')`
+- **Leccion**: `post_sell_max_multiplier` (GeckoTerminal, 1h) es inutil — tokens moonean 5-30min y mueren a 30-60min. Usar `post_trade_checks` (DexScreener, 2/5/10/15/30/60min) para analisis real.
 
 ---
 

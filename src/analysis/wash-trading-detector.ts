@@ -10,6 +10,8 @@ export interface WashTradingResult {
   walletConcentration: number; // % of TXs from top wallet (0-100)
   sameAmountRatio: number;     // % of buys with identical amount ±5% (0-100)
   penalty: number;             // 0 to -20
+  // v11t: Early buyer wallet addresses (for cross-ref with current holders)
+  earlyBuyerWallets: string[];
 }
 
 const EMPTY_RESULT: WashTradingResult = {
@@ -18,6 +20,7 @@ const EMPTY_RESULT: WashTradingResult = {
   walletConcentration: 0,
   sameAmountRatio: 0,
   penalty: 0,
+  earlyBuyerWallets: [],
 };
 
 /**
@@ -152,6 +155,7 @@ export async function checkWashTrading(
       walletConcentration: Math.round(walletConcentration * 10) / 10,
       sameAmountRatio: Math.round(sameAmountRatio * 10) / 10,
       penalty,
+      earlyBuyerWallets: Array.from(signerCounts.keys()),
     };
 
     logger.info(

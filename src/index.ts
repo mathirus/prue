@@ -25,6 +25,7 @@ import { PumpFunMonitor } from './detection/pumpfun-monitor.js';
 import { PumpSwapMonitor } from './detection/pumpswap-monitor.js';
 import { botEmitter } from './detection/event-emitter.js';
 import { TokenScorer } from './analysis/token-scorer.js';
+import { PublicKey } from '@solana/web3.js';
 import { existsSync, readFileSync, writeFileSync, unlinkSync } from 'fs';
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
@@ -111,7 +112,7 @@ import { TelegramBot } from './telegram/bot.js';
 import { WalletTracker } from './copy-trading/wallet-tracker.js';
 import { CopyExecutor } from './copy-trading/copy-executor.js';
 import { Cache } from './data/redis-cache.js';
-import { closeDb } from './data/database.js';
+import { closeDb, getDb } from './data/database.js';
 import { CreatorTracker } from './analysis/creator-tracker.js';
 import { checkCreatorWalletAge, type CreatorAgeResult } from './analysis/creator-checker.js';
 import { checkAuthorities } from './analysis/security-checker.js';
@@ -253,6 +254,12 @@ async function main(): Promise<void> {
       logger.info('[bot] Smart wallet list refreshed successfully');
     }
   }).catch(err => logger.debug(`[bot] Smart wallet refresh skipped: ${String(err).slice(0, 80)}`));
+
+  // v11t: Backfill shadow position outcomes from DexScreener data
+  const backfilled = tradeLogger.backfillShadowOutcomes();
+  if (backfilled > 0) {
+    logger.info(`[bot] Backfilled ${backfilled} shadow position outcomes from pool_outcome`);
+  }
 
   // v9g: Shadow data collection runs ALWAYS (even in live mode) for ML training
   // LiqRemovalMonitor disabled — WebSocket traffic saturates Helius free tier
@@ -922,6 +929,10 @@ async function main(): Promise<void> {
   const MIN_BALANCE_FLOOR_SOL = 0.002;      // Hard stop: never trade below this (v9n: lowered for 0.001 validation trades)
   let buyInProgress = false;                 // Lock to prevent concurrent buys (race condition fix)
 
+  // v11v: Rug counter — pause after N rugs in session (was: pause on first rug)
+  let sessionRugCount = 0;
+  const MAX_RUGS_BEFORE_PAUSE = 3;
+
   // ── v9s: TIERED ANALYSIS — filter cheap before spending RPC budget ──
   // Tier 0: Deployer rate limiter (0 RPC) — blocks spam deployers
   const deployerRecentPools = new Map<string, number[]>(); // deployer → timestamps
@@ -970,13 +981,9 @@ async function main(): Promise<void> {
     poolCount++;
     const latency = Date.now() - pool.detectedAt;
 
-    logger.info('');
-    logger.info(`===== POOL NUEVO #${poolCount} =====`);
-    logger.info(`Fuente:   ${pool.source}`);
-    logger.info(`Token:    ${pool.baseMint.toBase58()}`);
-    logger.info(`Pool:     ${shortenAddress(pool.poolAddress)}`);
-    logger.info(`TX:       ${solscanTx(pool.txSignature)}`);
-    logger.info(`Latencia: ${latency}ms`);
+    // v11u: Condensed pool header (was 7 lines, now 2)
+    logger.info(`===== POOL #${poolCount} | ${pool.source} | ${pool.baseMint.toBase58()} | ${latency}ms =====`);
+    logger.debug(`  Pool: ${shortenAddress(pool.poolAddress)} | TX: ${solscanTx(pool.txSignature)}`);
 
     try {
       // Verificar si está pausado
@@ -1020,7 +1027,7 @@ async function main(): Promise<void> {
         logger.info(`[bot] ❌ Latencia muy alta (${latency}ms > ${MAX_DETECTION_LATENCY_MS}ms), posible evento viejo`);
         return;
       }
-      logger.info(`[bot] ✓ Detección en tiempo real (${latency}ms de latencia)`);
+      // v11u: Latency already logged in pool header, skip duplicate
 
       // ═══════ v9s: TIER 0 — FREE CHECKS (0 RPC calls) ═══════
       // Deployer rate limiter: skip if deployer launched 2+ pools in last 5min
@@ -1156,6 +1163,19 @@ async function main(): Promise<void> {
                   setTimeout(() => { logger.warn(`[creator-deep] Profile timed out (${DEEP_TIMEOUT_MS / 1000}s), skipping`); resolve(null); }, DEEP_TIMEOUT_MS),
                 );
                 const profile = await Promise.race([deepPromise, deepTimeout]);
+                // v11t: If timeout won, let deep check keep running and save result to DB when done
+                if (!profile) {
+                  const poolId = pool.id;
+                  deepPromise.then((bgProfile) => {
+                    if (bgProfile) {
+                      tradeLogger.updateCreatorDeepResult(poolId, bgProfile.reputationScore, bgProfile.fundingSource);
+                      if (bgProfile.funderFanOut) {
+                        tradeLogger.updateFunderFanOut(poolId, bgProfile.funderFanOut);
+                      }
+                      logger.info(`[creator-deep] Background profile saved: ${bgProfile.reputationScore} (${bgProfile.reputationReason}) for pool ${poolId.slice(0, 8)}`);
+                    }
+                  }).catch(() => {}); // ignore background errors
+                }
                 return { creator, age: null as CreatorAgeResult | null, profile };
               } else {
                 // Fallback: simple age check (original behavior)
@@ -1245,7 +1265,8 @@ async function main(): Promise<void> {
             fastSecurity.checks.liquidityUsd,
           );
           if (shadow) {
-            logger.info(`[shadow] Tracking rejected: ${tokenKey.slice(0, 8)} | score=${currentScore}`);
+            // v11u: Demoted to debug (already logged via FAST REJECT / DEFERRED REJECT)
+            logger.debug(`[shadow] Tracking rejected: ${tokenKey.slice(0, 8)} | score=${currentScore}`);
           } else {
             logger.debug(`[shadow] DROPPED: ${tokenKey.slice(0, 8)} | score=${currentScore}`);
           }
@@ -1261,9 +1282,20 @@ async function main(): Promise<void> {
         if (fastSecurity.checks.isHoneypot) reasons.push('honeypot');
         if (fastSecurity.checks.liquidityUsd < config.analysis.minLiquidityUsd) reasons.push('low_liq');
         if (fastSecurity.checks.dangerousExtensions?.length) reasons.push('dangerous_ext');
+        // v11r: Shadow mode for freeze_auth — track pools that would pass if freeze was revoked
+        const freezeWeight = config.analysis.weights.freezeAuthority ?? 15;
+        const fastThreshold = Math.max(0, config.analysis.minScore - 15);
+        const wouldPassWithFreeze = !fastSecurity.checks.freezeAuthorityRevoked
+          && fastSecurity.checks.mintAuthorityRevoked
+          && (fastSecurity.score + freezeWeight) >= fastThreshold
+          && fastSecurity.checks.liquidityUsd >= config.analysis.minLiquidityUsd;
+        if (wouldPassWithFreeze) {
+          logger.warn(`[SHADOW-FREEZE] 🔍 ${tokenKey.slice(0, 8)} would pass with freeze revoked: score=${fastSecurity.score}+${freezeWeight}=${fastSecurity.score + freezeWeight} >= ${fastThreshold}, liq=$${Math.round(fastSecurity.checks.liquidityUsd)}`);
+          reasons.push('shadow_freeze');
+        }
         tradeLogger.updateRejectionReasons(pool.id, reasons.join(','));
         tradeLogger.updateRejectionStage(pool.id, 'fast_analysis');
-        logger.info(`[bot] ❌ FAST REJECT (${fastSecurity.score}/100)`);
+        logger.info(`[bot] ❌ FAST REJECT (${fastSecurity.score}/100)${wouldPassWithFreeze ? ' [SHADOW-FREEZE tracked]' : ''}`);
         openShadowForRejected();
         return;
       }
@@ -1299,6 +1331,51 @@ async function main(): Promise<void> {
         }
       }
 
+      // v11y: Network rug check — cross-reference creator/funder against pool_outcome data
+      if (coinCreator) {
+        const networkRug = creatorTracker.getNetworkRugHistory(
+          coinCreator,
+          creatorDeepProfile?.fundingSource ?? null,
+          creatorDeepProfile?.fundingSourceHop2 ?? null,
+        );
+        if (networkRug.penalty !== 0) {
+          logger.info(`[bot] Network rug check: creator=${networkRug.creatorPriorRugs} funder=${networkRug.funderPriorRugs} hop2=${networkRug.funderHop2PriorRugs} penalty=${networkRug.penalty}`);
+          tradeLogger.updateNetworkRugPenalty(pool.id, networkRug.penalty);
+        }
+        if (networkRug.shouldBlock) {
+          logger.warn(`[bot] ❌ NETWORK RUG BLOCK: ${networkRug.reason}. Skipping.`);
+          tradeLogger.logDetection(pool, fastSecurity);
+          tradeLogger.updateRejectionReasons(pool.id, `network_rug:${networkRug.reason}`);
+          tradeLogger.updateRejectionStage(pool.id, 'network_rug');
+          // Auto-blacklist if creator/funder has 3+ rugs
+          if (networkRug.creatorPriorRugs >= 3) {
+            scammerBlacklist.promoteFromPoolOutcome(coinCreator, networkRug.creatorPriorRugs, 'creator');
+          }
+          if (creatorDeepProfile?.fundingSource && networkRug.funderPriorRugs >= 3) {
+            scammerBlacklist.promoteFromPoolOutcome(creatorDeepProfile.fundingSource, networkRug.funderPriorRugs, 'funder');
+          }
+          openShadowForRejected();
+          return;
+        }
+        // Non-blocking penalty: apply to score
+        if (networkRug.penalty < 0) {
+          fastSecurity.score += networkRug.penalty;
+          if (fastSecurity.breakdown) {
+            fastSecurity.breakdown.networkRugPenalty = networkRug.penalty;
+          }
+          logger.info(`[bot] Network rug penalty ${networkRug.penalty} applied → score=${fastSecurity.score}`);
+          // Re-check if score still passes
+          if (fastSecurity.score < config.analysis.minScore) {
+            logger.warn(`[bot] ❌ Score ${fastSecurity.score} < ${config.analysis.minScore} after network rug penalty. Skipping.`);
+            tradeLogger.logDetection(pool, fastSecurity);
+            tradeLogger.updateRejectionReasons(pool.id, `network_rug_penalty:${networkRug.reason}`);
+            tradeLogger.updateRejectionStage(pool.id, 'network_rug_penalty');
+            openShadowForRejected();
+            return;
+          }
+        }
+      }
+
       // v9A: AllenHark check on funding source (if available from deep profile)
       if (creatorDeepProfile?.fundingSource && allenHarkBlacklist.size > 0) {
         if (allenHarkBlacklist.isBlacklisted(creatorDeepProfile.fundingSource)) {
@@ -1311,8 +1388,12 @@ async function main(): Promise<void> {
         }
       }
 
-      // ANTI-RUG: Creator deep check (scammer network, etc.)
+      // ANTI-RUG: Creator deep check (scammer network, fan-out, etc.)
       if (creatorDeepProfile) {
+        // v11r: Persist fan-out data for analysis (even if not detected)
+        if (creatorDeepProfile.funderFanOut) {
+          tradeLogger.updateFunderFanOut(pool.id, creatorDeepProfile.funderFanOut);
+        }
         if (creatorDeepProfile.isKnownScammerNetwork) {
           logger.warn(`[bot] ❌ SCAMMER NETWORK: creator funded by blacklisted wallet. Skipping.`);
           tradeLogger.logDetection(pool, fastSecurity);
@@ -1325,6 +1406,15 @@ async function main(): Promise<void> {
           logger.warn(`[bot] ❌ SCAM CLUSTER: funder has ${creatorDeepProfile.fundingNetworkSize} creators. Skipping.`);
           tradeLogger.logDetection(pool, fastSecurity);
           tradeLogger.updateRejectionReasons(pool.id, 'scam_cluster');
+          tradeLogger.updateRejectionStage(pool.id, 'creator_deep');
+          openShadowForRejected();
+          return;
+        }
+        // v11r: Funder fan-out (sybil pre-funding pattern)
+        if (creatorDeepProfile.funderFanOut?.detected) {
+          logger.warn(`[bot] ❌ FUNDER FAN-OUT: ${creatorDeepProfile.fundingSource?.slice(0, 8)} sent ~${creatorDeepProfile.funderFanOut.uniformAmountSol} SOL to ${creatorDeepProfile.funderFanOut.recentTxCount}+ wallets. Skipping.`);
+          tradeLogger.logDetection(pool, fastSecurity);
+          tradeLogger.updateRejectionReasons(pool.id, 'funder_fan_out');
           tradeLogger.updateRejectionStage(pool.id, 'creator_deep');
           openShadowForRejected();
           return;
@@ -1392,7 +1482,7 @@ async function main(): Promise<void> {
         } catch (obsErr) {
           logger.warn(`[bot] ⚠️ ${String(obsErr)} — passing through (buy sim will validate)`);
           observationResult = { stable: true, dropPct: 0, elapsedMs: OBS_GLOBAL_TIMEOUT_MS, initialSolReserve: 0, finalSolReserve: 0 };
-          washCheck = { penalty: 0, walletConcentration: 0, sameAmountRatio: 0, uniqueWallets: 0, totalTxsSampled: 0 };
+          washCheck = { penalty: 0, walletConcentration: 0, sameAmountRatio: 0, uniqueWallets: 0, totalTxsSampled: 0, earlyBuyerWallets: [] };
           coordCheck = { buyerCount: 0, sharedFunderCount: 0, selfBuyDetected: false, penalty: 0, reason: 'timeout' };
           organicCheck = { uniqueBuyers: 0, totalTxsSampled: 0, buyerConcentration: 0, bonus: 0, reason: 'timeout' };
           smartCheck = { holdingCount: 0, eliteCount: 0, strongCount: 0, consistentCount: 0, bonus: 0, wallets: [] };
@@ -1593,6 +1683,37 @@ async function main(): Promise<void> {
         }
       }
 
+      // v11t: Custom deploy penalty — pools with high initial reserves are riskier
+      // PumpFun graduation pools have ~85 SOL. Pools with 185+ SOL are custom deploys
+      // where the creator put hundreds of SOL of their own capital → more to drain in a rug.
+      // Data (N=131): obs_sol>=185 has 14% rug rate vs 9.5% for graduation pools.
+      // Backtest: -10 penalty blocks 4 rugs (saves 0.05 SOL), loses 14 low-value winners (loses 0.006 SOL). Net +0.044 SOL.
+      if (observationResult && observationResult.initialSolReserve > 0) {
+        const initialSol = observationResult.initialSolReserve / 1e9;
+        if (initialSol >= 185) {
+          const oldScore = security.score;
+          security.score = Math.max(0, security.score - 10);
+          security.passed = security.score >= config.analysis.minScore;
+          logger.warn(`[bot] Custom deploy penalty: -10 (initial reserve ${initialSol.toFixed(0)} SOL >= 185) → score ${oldScore}→${security.score}`);
+        }
+      }
+
+      // v11t: Cross-ref early buyers with creator's funder (insider detection — SHADOW)
+      // If the creator's funder also bought on the bonding curve → insider buying signal
+      // Zero RPC cost: uses wash-trading earlyBuyerWallets + creatorDeepProfile.fundingSource
+      if (washResult && washResult.earlyBuyerWallets.length > 0 && creatorDeepProfile?.fundingSource) {
+        const funder = creatorDeepProfile.fundingSource;
+        const hop2 = creatorDeepProfile.fundingSourceHop2;
+        const earlyBuyers = new Set(washResult.earlyBuyerWallets);
+        const funderBought = earlyBuyers.has(funder);
+        const hop2Bought = hop2 ? earlyBuyers.has(hop2) : false;
+        if (funderBought || hop2Bought) {
+          const who = funderBought ? `funder(${funder.slice(0, 8)})` : `hop2(${hop2!.slice(0, 8)})`;
+          logger.warn(`[bot] [INSIDER-SHADOW] 🔍 ${who} bought on bonding curve! Early buyers: ${washResult.earlyBuyerWallets.length}, funder match: YES`);
+          // TODO: Once we have N>=20 with this signal, evaluate as penalty
+        }
+      }
+
       // ML CLASSIFIER blocking check
       if (config.analysis.mlClassifier.enabled) {
         const mlActive = config.analysis.mlClassifier.minConfidence !== 0.70
@@ -1640,6 +1761,11 @@ async function main(): Promise<void> {
         tradeLogger.updateRejectionStage(pool.id, 'deferred_analysis');
         openShadowForRejected();
         return;
+      }
+
+      // v11t: Shadow track holder inversion signal (holder_penalty=0 = sybil risk)
+      if (security.breakdown?.holderPenalty === 0 && security.passed) {
+        logger.warn(`[holder-inversion] ⚠️ SHADOW: ${tokenKey.slice(0, 8)} has holder_penalty=0 (perfect distribution) — historically correlates with 100% wipeout rate`);
       }
 
       // Re-check max concurrent AFTER analysis + observation WITH buyInProgress lock
@@ -1849,6 +1975,14 @@ async function main(): Promise<void> {
             freezeAuthRevoked: security.checks.freezeAuthorityRevoked,
             // v11n: Pass creator address for WebSocket monitoring
             creatorAddress: coinCreator ?? undefined,
+            // v11t: Pre-cache vault addresses for PriceMonitor (saves 1.5s on first price read)
+            vaultCache: result.poolReserves?.baseVault && result.poolReserves?.quoteVault
+              ? {
+                  baseVault: new PublicKey(result.poolReserves.baseVault),
+                  quoteVault: new PublicKey(result.poolReserves.quoteVault),
+                  isReversed: result.poolReserves.isReversed ?? false,
+                }
+              : undefined,
           },
         );
 
@@ -1881,11 +2015,13 @@ async function main(): Promise<void> {
         }
 
         // v8p: Balance snapshot after buy
-        try {
-          const postBuyBalance = await wallet.getBalance(rpcManager.connection);
-          tradeLogger.logBalanceSnapshot(postBuyBalance, 'buy', tokenKey);
-          setCachedBalanceLamports(Math.round(postBuyBalance * 1e9)); // v9w: update cache
-        } catch { /* non-fatal */ }
+        // v11u: Fire-and-forget (was blocking ~100-300ms before position management started)
+        wallet.getBalance(rpcManager.connection)
+          .then(postBuyBalance => {
+            tradeLogger.logBalanceSnapshot(postBuyBalance, 'buy', tokenKey);
+            setCachedBalanceLamports(Math.round(postBuyBalance * 1e9));
+          })
+          .catch(() => { /* non-fatal */ });
 
         // v11g: Post-buy honeypot check — simulate sell immediately after buy
         // Catches 100% of "pure honeypots" that block ALL sells (Custom:6024/6025)
@@ -2097,6 +2233,7 @@ async function main(): Promise<void> {
       currentPrice: number;
       closedAt?: number;
       pnlSol?: number;
+      exitReason?: string;
     }) => {
       // v11f: Resume pool parsing if we now have capacity
       if (positionManager.activeTradeCount < config.risk.maxConcurrent) {
@@ -2111,14 +2248,47 @@ async function main(): Promise<void> {
         position.id,
         position.entryPrice,
         position.closedAt ?? Date.now(),
-        position.currentPrice,  // v8q: pass sell price for post-trade tracking
       );
 
       // v8p: Balance snapshot after position close
       wallet!.getBalance(rpcManager.connection).then(bal => {
         tradeLogger.logBalanceSnapshot(bal, 'sell', position.tokenMint.toBase58(), position.pnlSol);
       }).catch(() => { /* non-fatal */ });
+
+      // v11q: Auto-blacklist creator wallet on rug — prevents same scammer hitting us again
+      // Includes max_retries: when all sells fail, pool is drained (de facto rug)
+      const isRug = position.exitReason?.includes('rug') || position.exitReason === 'pool_drained' || position.exitReason?.startsWith('stranded') || position.exitReason === 'max_retries';
+      if (isRug) {
+        try {
+          const mint = position.tokenMint.toBase58();
+          const row = getDb().prepare('SELECT creator_wallet FROM token_creators WHERE token_mint = ?').get(mint) as { creator_wallet: string } | undefined;
+          if (row?.creator_wallet) {
+            scammerBlacklist.addToBlacklist(row.creator_wallet, `auto_rug: ${mint.slice(0, 8)} (${position.exitReason})`);
+          }
+        } catch (err) {
+          logger.debug(`[bot] Failed to auto-blacklist creator: ${err}`);
+        }
+
+        // v11v: Pause bot after N rugs in session (was: pause on first rug)
+        if (config.risk.pauseOnRug && telegramBot) {
+          sessionRugCount++;
+          const mint = position.tokenMint.toBase58();
+          if (sessionRugCount >= MAX_RUGS_BEFORE_PAUSE) {
+            telegramBot.paused.value = true;
+            logger.warn(`[bot] ⏸ PAUSE_ON_RUG: Bot paused after ${sessionRugCount} rugs in session. Last: ${mint.slice(0, 8)} (${position.exitReason}). Use /resume to continue.`);
+            telegramBot.notificationService.sendMessage(
+              `⏸ <b>BOT PAUSADO</b>\n\n${sessionRugCount} rugs en esta sesión.\nÚltimo: <code>${mint.slice(0, 8)}</code>\nRazón: ${position.exitReason}\n\nUsá /resume para reanudar.`
+            ).catch(() => {});
+          } else {
+            logger.warn(`[bot] ⚠ RUG ${sessionRugCount}/${MAX_RUGS_BEFORE_PAUSE}: ${mint.slice(0, 8)} (${position.exitReason}). Bot sigue activo.`);
+            telegramBot.notificationService.sendMessage(
+              `⚠ <b>RUG ${sessionRugCount}/${MAX_RUGS_BEFORE_PAUSE}</b>\n\n<code>${mint.slice(0, 8)}</code>: ${position.exitReason}\nEl bot sigue activo. Se pausa a los ${MAX_RUGS_BEFORE_PAUSE}.`
+            ).catch(() => {});
+          }
+        }
+      }
     });
+
   }
 
   // ──── START DETECTORS ───────────────────────────────────────────────
@@ -2152,7 +2322,7 @@ async function main(): Promise<void> {
   logger.info(`[bot] ViperSnipe is LIVE`);
   logger.info(`[bot] Monitors: ${detectors.length} | Dry run: ${config.risk.dryRun} | Detection only: ${detectionOnly} | Shadow: ${config.risk.shadowMode}`)
   logger.info(`[bot] Max trades/sesión: ${config.risk.maxTradesPerSession || '∞'} | Max SOL/trade: ${config.risk.maxPositionSol}`);
-  logger.info(`[bot] Copy trading: ${config.copyTrading.enabled ? 'ON' : 'OFF'} | Telegram: ${telegramBot ? 'ON' : 'OFF'}`);
+  logger.info(`[bot] Copy trading: ${config.copyTrading.enabled ? 'ON' : 'OFF'} | Telegram: ${telegramBot ? 'ON' : 'OFF'} | Pause on rug: ${config.risk.pauseOnRug ? 'ON' : 'OFF'}`);
   logger.info('[bot] Press Ctrl+C to stop');
   logger.info('');
 

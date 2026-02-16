@@ -117,7 +117,8 @@ export async function checkAuthorities(
     }
 
     if (isToken2022) {
-      logger.warn(`[security] ⚠️ Token-2022 program detected for ${mintAddress.toBase58().slice(0, 8)}... — Jupiter CANNOT sell these`);
+      // v11u: Demoted to debug (tier1 block line already logs this at warn level)
+      logger.debug(`[security] Token-2022 program detected for ${mintAddress.toBase58().slice(0, 8)}...`);
     }
 
     return {

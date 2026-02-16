@@ -107,7 +107,8 @@ export class PumpSwapMonitor {
 
     if (!isPoolCreate) return;
 
-    logger.info(`[pumpswap] New PumpSwap pool detected! TX: ${signature}`);
+    // v11u: Demoted to debug (pool header in index.ts already logs this)
+    logger.debug(`[pumpswap] New PumpSwap pool detected! TX: ${signature}`);
 
     this.enqueueFetch(signature, slot);
   }

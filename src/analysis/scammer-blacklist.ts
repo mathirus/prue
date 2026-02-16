@@ -83,6 +83,25 @@ export class ScammerBlacklist {
     }
   }
 
+  /**
+   * v11y: Auto-promote wallets to blacklist based on pool_outcome rug data.
+   * If a creator or funder has 3+ rugs in detected_pools, blacklist them.
+   */
+  promoteFromPoolOutcome(wallet: string, rugCount: number, role: 'creator' | 'funder'): void {
+    if (rugCount < 3 || this.blacklistedWallets.has(wallet)) return;
+
+    const reason = `pool_outcome_${role}: ${rugCount} rugs`;
+    this.addToBlacklist(wallet, reason);
+
+    try {
+      const db = getDb();
+      db.prepare('UPDATE scammer_blacklist SET linked_rug_count = ? WHERE wallet = ?')
+        .run(rugCount, wallet);
+    } catch (err) {
+      logger.debug(`[blacklist] Failed to update rug count after pool_outcome promote: ${err}`);
+    }
+  }
+
   /** Get total count of blacklisted wallets */
   get size(): number {
     return this.blacklistedWallets.size;

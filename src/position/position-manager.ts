@@ -4,7 +4,7 @@ import { botEmitter } from '../detection/event-emitter.js';
 import { PriceMonitor } from './price-monitor.js';
 import { LiquidityRemovalMonitor, type LiqEventSeverity } from './liq-removal-monitor.js';
 import { CreatorWalletMonitor, type CreatorEventType } from './creator-wallet-monitor.js';
-import { evaluateTakeProfit, calculateSellAmount, type TakeProfitAction } from './take-profit.js';
+import { evaluateTakeProfit, calculateSellAmount, evaluateSmartTp, type TakeProfitAction, type SmartTpSignals } from './take-profit.js';
 import { evaluateStopLoss } from './stop-loss.js';
 import { calculateMoonBag, shouldKeepMoonBag } from './moon-bag.js';
 import { TradeLogger } from '../data/trade-logger.js';
@@ -14,6 +14,7 @@ import { analyzeHolders, computeNonPoolHHI } from '../analysis/holder-analyzer.j
 import { generateId, shortenAddress, formatSol, formatPct } from '../utils/helpers.js';
 import type { BotConfig, DetectedPool, Position, PoolSource, TradeResult } from '../types.js';
 import { WSOL_MINT } from '../constants.js';
+import { setSellPriorityBoost, clearPriorityFeeCache } from '../execution/pumpswap-swap.js';
 
 type SellFunction = (
   tokenMint: PublicKey,
@@ -40,6 +41,8 @@ export class PositionManager {
   // Exponential backoff for sell retries - don't hammer RPC
   private sellRetryAfter = new Map<string, number>(); // positionId → timestamp when retry is allowed
   private static readonly SELL_RETRY_BASE_DELAY_MS = 2_000; // v8j: was 5s → 2s (2s+4s=6s total vs 5+10+20=35s)
+  // v11w: Faster retry for emergency sells (rug_pull, sell_burst, liq_removal) — 500ms flat
+  private static readonly EMERGENCY_SELL_RETRY_DELAY_MS = 500;
   // v8l: TP sell cooldown — prevents cascading 429 when TP triggers every price poll
   private tpSellCooldownUntil = new Map<string, number>(); // positionId → timestamp
   private static readonly TP_SELL_COOLDOWN_MS = 15_000; // 15s between TP sell attempts
@@ -75,6 +78,14 @@ export class PositionManager {
   private stalePriceCount = new Map<string, number>();
   // v11p: Track positions where creator transfer was detected (combo accelerator: skip stale grace period)
   private creatorTransferPositions = new Set<string>();
+  // v11u: Buy drought detector — consecutive snapshots with 0 buys
+  private buyDroughtCount = new Map<string, number>(); // positionId → consecutive 0-buy snapshots
+  private buyDroughtTightened = new Set<string>();      // positions where trailing was already tightened
+  // v11x: Early exit — tick counter per position (increments every DB_SAVE_INTERVAL_MS ~10s)
+  // Strategy C: if mul < 1.02 at tick 2 AND mul < 1.03 at tick 3 → emergency sell
+  // Validated: 12/12 rugs caught at tick2 < 1.02 (N=111 v11o-v11w), 0/44 safe positions misclassified
+  private earlyExitTickCount = new Map<string, number>(); // positionId → tick number
+  private earlyExitDanger = new Set<string>(); // positions flagged DANGER at tick 2
   // v9h: After N consecutive stale prices, trigger emergency sell
   // History: 3→6 (v9h, 429 false positives). 6→4 (v9y, sell-priority reduces 429 during sells)
   // v9y: With sell-priority mode, non-sell RPCs pause during sells → fewer false 429 stales.
@@ -83,7 +94,8 @@ export class PositionManager {
   private static readonly STALE_DRAIN_THRESHOLD = 4;
   // v9h: Grace period — don't trigger STALE DRAIN in the first 30s of a position
   // Newly opened positions naturally have stale data while PriceMonitor initializes.
-  private static readonly STALE_DRAIN_GRACE_MS = 30_000;
+  // v11q: Reduced from 30s to 15s — with 1.5s polls, 15s = 8-10 data points. 30s was too long.
+  private static readonly STALE_DRAIN_GRACE_MS = 15_000;
 
   constructor(
     private readonly config: BotConfig,
@@ -231,7 +243,7 @@ export class PositionManager {
     solInvested: number,
     securityScore: number,
     initialSolReserve?: number,
-    extra?: { holderCount?: number; liquidityUsd?: number; mintAuthRevoked?: boolean; freezeAuthRevoked?: boolean; creatorAddress?: string },
+    extra?: { holderCount?: number; liquidityUsd?: number; mintAuthRevoked?: boolean; freezeAuthRevoked?: boolean; creatorAddress?: string; vaultCache?: { baseVault: PublicKey; quoteVault: PublicKey; isReversed: boolean } },
   ): Position {
     // Prevent duplicate positions for the same token
     if (this.hasActivePosition(pool.baseMint)) {
@@ -273,6 +285,8 @@ export class PositionManager {
       (extra?.mintAuthRevoked !== undefined || extra?.freezeAuthRevoked !== undefined)
         ? { mintRevoked: extra?.mintAuthRevoked ?? false, freezeRevoked: extra?.freezeAuthRevoked ?? false }
         : undefined,
+      // v11t: Pre-cached vault addresses from buy (saves 1 poll cycle)
+      extra?.vaultCache,
     );
     // v8s: Subscribe to WebSocket liquidity removal monitor for instant rug detection
     if (this.liqMonitor && pool.source === 'pumpswap') {
@@ -469,19 +483,55 @@ export class PositionManager {
           const noReserveInGrace = (entryRes === 0 || reserveNeverUpdated) && posAge < PositionManager.STALE_DRAIN_GRACE_MS;
 
           if (noReserveInGrace) {
-            // Within grace period: no reserve data is expected, don't sell based on burst alone
+            // v11q: Conditional Grace — instead of blindly waiting, fetch reserves NOW (1 RPC call)
+            // Then decide: reserves dropped → sell, reserves OK → monitor
+            // Data: BLQrAJ8d burst at 4s during grace, pool was drained but bot waited 30s to act
             logger.warn(
-              `[positions] SELL BURST but NO RESERVE DATA in GRACE period: ${shortenAddress(position.tokenMint)} (${burstCount} sells, age=${Math.round(posAge/1000)}s) — monitoring, NOT selling`,
+              `[positions] SELL BURST in GRACE (${burstCount} sells, age=${Math.round(posAge/1000)}s) — fetching reserves to decide...`,
             );
-            // Accelerate drain check like a warning
-            const currentStale = this.stalePriceCount.get(position.id) ?? 0;
-            if (currentStale < PositionManager.STALE_DRAIN_THRESHOLD - 1) {
-              this.stalePriceCount.set(position.id, PositionManager.STALE_DRAIN_THRESHOLD - 1);
-            }
-          } else if (entryRes === 0 || reserveNeverUpdated || reserveDropPct >= PositionManager.BURST_RESERVE_DROP_PCT) {
-            // Reserve dropped 20%+ OR no reserve data (after grace) OR reserve stale → sell
+            const mintStr = position.tokenMint.toBase58();
+            this.priceMonitor.fetchSinglePoolReserves(mintStr).then(currentReserveLamports => {
+              if (this.sellingPositions.has(position.id)) return; // Already selling
+              if (currentReserveLamports === null) {
+                // RPC failed — can't confirm, accelerate stale counter as before
+                logger.warn(`[positions] Grace reserve fetch failed for ${shortenAddress(position.tokenMint)} — accelerating stale check`);
+                const currentStale = this.stalePriceCount.get(position.id) ?? 0;
+                if (currentStale < PositionManager.STALE_DRAIN_THRESHOLD - 1) {
+                  this.stalePriceCount.set(position.id, PositionManager.STALE_DRAIN_THRESHOLD - 1);
+                }
+                return;
+              }
+              const entryResCheck = position.entryReserveLamports ?? 0;
+              const dropPct = entryResCheck > 0 ? ((entryResCheck - currentReserveLamports) / entryResCheck) * 100 : 0;
+              if (dropPct >= PositionManager.BURST_RESERVE_DROP_PCT) {
+                // Reserves confirmed dropping → SELL
+                logger.warn(
+                  `[positions] GRACE CONFIRMED RUG: ${shortenAddress(position.tokenMint)} reserves dropped ${dropPct.toFixed(0)}% — emergency sell`,
+                );
+                position.sellBurstCount = burstCount;
+                this.sellingPositions.add(position.id);
+                this.priceMonitor.pause();
+                this.executeStopLoss(position, 'rug_pull', true)
+                  .catch(err => logger.error(`[positions] Grace rug sell error: ${err}`))
+                  .finally(() => {
+                    this.sellingPositions.delete(position.id);
+                    this.priceMonitor.resume();
+                  });
+              } else {
+                // Reserves OK — false alarm, monitor normally
+                logger.info(
+                  `[positions] Grace reserves OK for ${shortenAddress(position.tokenMint)}: drop ${dropPct.toFixed(1)}% < ${PositionManager.BURST_RESERVE_DROP_PCT}% — continuing`,
+                );
+                // Update position with fresh reserve data
+                position.currentReserveLamports = currentReserveLamports;
+              }
+            }).catch(err => {
+              logger.debug(`[positions] Grace reserve check error: ${err}`);
+            });
+          } else if (entryRes === 0 || reserveDropPct >= PositionManager.BURST_RESERVE_DROP_PCT) {
+            // Reserve dropped 20%+ OR no reserve data → sell immediately
             position.sellBurstCount = burstCount;
-            const reason = reserveNeverUpdated ? 'STALE RESERVE' : entryRes === 0 ? 'NO RESERVE DATA' : 'RESERVE DROP';
+            const reason = entryRes === 0 ? 'NO RESERVE DATA' : 'RESERVE DROP';
             logger.warn(
               `[positions] SELL BURST + ${reason}: Emergency selling ${shortenAddress(position.tokenMint)} (${burstCount} sells, reserve ${reserveDropPct >= 0 ? '-' : '+'}${Math.abs(reserveDropPct).toFixed(0)}%)`,
             );
@@ -495,6 +545,57 @@ export class PositionManager {
                 this.sellingPositions.delete(position.id);
                 this.priceMonitor.resume();
               });
+          } else if (reserveNeverUpdated) {
+            // v11v: Reserve looks stale (entry ≈ current within 0.1%) but we're past grace period.
+            // Could be stale data (real rug) OR stable pool (false positive like 7WMpj4tZ).
+            // Instead of selling immediately, fetch fresh reserves to confirm — same pattern as grace.
+            // Data: 7WMpj4tZ was sold at -0.7% due to stale reserve, pool went +239% after.
+            logger.warn(
+              `[positions] SELL BURST + STALE RESERVE: ${shortenAddress(position.tokenMint)} (${burstCount} sells, age=${Math.round(posAge/1000)}s) — fetching fresh reserves...`,
+            );
+            const mintStr = position.tokenMint.toBase58();
+            this.priceMonitor.fetchSinglePoolReserves(mintStr).then(freshReserve => {
+              if (this.sellingPositions.has(position.id)) return;
+              if (freshReserve === null) {
+                // RPC failed — can't confirm, sell conservatively
+                logger.warn(`[positions] Stale reserve fetch FAILED for ${shortenAddress(position.tokenMint)} — emergency sell (can't confirm)`);
+                position.sellBurstCount = burstCount;
+                this.sellingPositions.add(position.id);
+                this.priceMonitor.pause();
+                this.executeStopLoss(position, 'sell_burst_detected', true)
+                  .catch(err => logger.error(`[positions] Stale burst sell error: ${err}`))
+                  .finally(() => {
+                    this.sellingPositions.delete(position.id);
+                    this.priceMonitor.resume();
+                  });
+                return;
+              }
+              const entryResCheck = position.entryReserveLamports ?? 0;
+              const dropPct = entryResCheck > 0 ? ((entryResCheck - freshReserve) / entryResCheck) * 100 : 0;
+              if (dropPct >= PositionManager.BURST_RESERVE_DROP_PCT) {
+                // Fresh reserves confirm drain → SELL
+                logger.warn(
+                  `[positions] STALE CONFIRMED RUG: ${shortenAddress(position.tokenMint)} fresh reserves dropped ${dropPct.toFixed(0)}% — emergency sell`,
+                );
+                position.sellBurstCount = burstCount;
+                this.sellingPositions.add(position.id);
+                this.priceMonitor.pause();
+                this.executeStopLoss(position, 'sell_burst_detected', true)
+                  .catch(err => logger.error(`[positions] Stale rug sell error: ${err}`))
+                  .finally(() => {
+                    this.sellingPositions.delete(position.id);
+                    this.priceMonitor.resume();
+                  });
+              } else {
+                // Fresh reserves OK → pool is stable, not stale. False alarm.
+                logger.info(
+                  `[positions] STALE reserve was STABLE: ${shortenAddress(position.tokenMint)} fresh drop ${dropPct.toFixed(1)}% < ${PositionManager.BURST_RESERVE_DROP_PCT}% — continuing`,
+                );
+                position.currentReserveLamports = freshReserve;
+              }
+            }).catch(err => {
+              logger.debug(`[positions] Stale reserve check error: ${err}`);
+            });
           } else {
             // Reserve healthy despite burst → normal high-activity trading, NOT a rug
             // Just accelerate drain check (same as warning severity)
@@ -677,6 +778,8 @@ export class PositionManager {
           const sellCount = this.liqMonitor?.getSellCount(poolStr) ?? 0;
           // v11o-data: Also log buy_count and cumulative_sell_count for ML time-series
           const { buys: recentBuys } = this.liqMonitor?.getBuySellRatio(poolStr) ?? { buys: 0 };
+          // v11s fix: pass actual cumulative sell count (was passing windowed sellCount — copypaste bug)
+          const cumulativeSells = this.liqMonitor?.getCumulativeSellCount(poolStr) ?? 0;
           this.tradeLogger.logPriceSnapshot(
             position.id,
             position.currentPrice,
@@ -686,10 +789,61 @@ export class PositionManager {
             solReserveLamports,
             sellCount,
             recentBuys,
-            sellCount, // cumulative sell count
+            cumulativeSells,
           );
         }
         this.lastDbSave.set(position.id, now);
+
+        // v11x: Early exit tick counter — increment on each DB save (~10s intervals)
+        // Strategy C: tick2 < 1.02 → DANGER, tick3 < 1.03 → emergency sell
+        if (position.entryPrice > 0 && position.currentPrice > 0 && !this.sellingPositions.has(position.id)) {
+          const tickNum = (this.earlyExitTickCount.get(position.id) ?? 0) + 1;
+          this.earlyExitTickCount.set(position.id, tickNum);
+          const mul = position.currentPrice / position.entryPrice;
+
+          if (tickNum === 2) {
+            // Tick 2 (~10s): flag DANGER if multiplier < 1.02
+            if (mul < 1.02) {
+              this.earlyExitDanger.add(position.id);
+              const reserveChg = position.entryReserveLamports && position.currentReserveLamports
+                ? ((position.currentReserveLamports - position.entryReserveLamports) / position.entryReserveLamports * 100).toFixed(1)
+                : '?';
+              logger.warn(
+                `[positions] EARLY EXIT DANGER: ${shortenAddress(position.tokenMint)} tick2 mul=${mul.toFixed(3)}x (<1.02) res=${reserveChg}% — watching tick3`,
+              );
+            } else {
+              logger.debug(`[positions] Early exit OK: ${shortenAddress(position.tokenMint)} tick2 mul=${mul.toFixed(3)}x (>=1.02)`);
+            }
+          } else if (tickNum === 3 && this.earlyExitDanger.has(position.id)) {
+            // Tick 3 (~20s): if still below 1.03 → emergency sell
+            if (mul < 1.03) {
+              logger.warn(
+                `[positions] EARLY EXIT SELL: ${shortenAddress(position.tokenMint)} tick2<1.02 AND tick3 mul=${mul.toFixed(3)}x (<1.03) — no traction, selling`,
+              );
+              this.earlyExitDanger.delete(position.id);
+              this.sellingPositions.add(position.id);
+              this.priceMonitor.pause();
+              this.executeStopLoss(position, 'early_exit')
+                .catch((err) => {
+                  logger.error(`[positions] Early exit sell error: ${err}`);
+                  const retries = (this.sellRetries.get(position.id) ?? 0) + 1;
+                  this.sellRetries.set(position.id, retries);
+                  this.sellRetryAfter.set(position.id, Date.now() + PositionManager.SELL_RETRY_BASE_DELAY_MS * Math.pow(2, retries - 1));
+                })
+                .finally(() => {
+                  this.sellingPositions.delete(position.id);
+                  this.priceMonitor.resume();
+                });
+              continue;
+            } else {
+              // Recovered above 1.03 at tick 3 — clear danger
+              logger.info(
+                `[positions] EARLY EXIT CLEARED: ${shortenAddress(position.tokenMint)} tick3 mul=${mul.toFixed(3)}x (>=1.03) — recovered, continuing`,
+              );
+              this.earlyExitDanger.delete(position.id);
+            }
+          }
+        }
       }
 
       // v8m/v9i: HARD CAP — if position already has too many sell attempts
@@ -779,11 +933,104 @@ export class PositionManager {
         }
       }
 
+      // v11u: Micro trailing — tight trailing in first 60s to catch ultra-fast rugs
+      // Data: 7/22 rugs peaked 1.01-1.05x in <60s then collapsed. Normal trailing never activates.
+      const microCfg = this.config.position.microTrailing;
+      if (microCfg.enabled && position.tpLevelsHit.length === 0 && !this.sellingPositions.has(position.id)) {
+        const posAge = now - position.openedAt;
+        if (posAge <= microCfg.windowMs && position.entryPrice > 0) {
+          const peakMult = position.peakPrice / position.entryPrice;
+          if (peakMult >= microCfg.minPeakMultiplier) {
+            const dropFromPeak = ((position.peakPrice - position.currentPrice) / position.peakPrice) * 100;
+            if (dropFromPeak >= microCfg.dropFromPeakPct) {
+              const currentMult = position.currentPrice / position.entryPrice;
+              logger.warn(
+                `[positions] MICRO TRAILING: ${shortenAddress(position.tokenMint)} peak=${peakMult.toFixed(3)}x now=${currentMult.toFixed(3)}x drop=${dropFromPeak.toFixed(1)}% in ${(posAge / 1000).toFixed(0)}s — selling`,
+              );
+              const retryAfter = this.sellRetryAfter.get(position.id) ?? 0;
+              if (now >= retryAfter) {
+                this.sellingPositions.add(position.id);
+                this.priceMonitor.pause();
+                this.executeStopLoss(position, 'trailing_stop')
+                  .catch((err) => {
+                    logger.error(`[positions] Micro trailing sell error: ${err}`);
+                    const retries = (this.sellRetries.get(position.id) ?? 0) + 1;
+                    this.sellRetries.set(position.id, retries);
+                    this.sellRetryAfter.set(position.id, Date.now() + PositionManager.SELL_RETRY_BASE_DELAY_MS * Math.pow(2, retries - 1));
+                  })
+                  .finally(() => {
+                    this.sellingPositions.delete(position.id);
+                    this.priceMonitor.resume();
+                  });
+                continue;
+              }
+            }
+          }
+        }
+      }
+
+      // v11u: Buy drought detector — no buyers while sellers active = dead token
+      // Data: Rugs have sell/buy ratio 21:1 vs winners 4.6:1
+      const droughtCfg = this.config.position.buyDrought;
+      if (droughtCfg.enabled && this.liqMonitor && !this.sellingPositions.has(position.id)) {
+        const poolStr = position.poolAddress.toBase58();
+        const { buys, sells } = this.liqMonitor.getBuySellRatio(poolStr);
+
+        if (buys === 0 && sells > 0) {
+          const count = (this.buyDroughtCount.get(position.id) ?? 0) + 1;
+          this.buyDroughtCount.set(position.id, count);
+
+          // Emergency sell: 30s+ drought with heavy selling
+          if (count >= droughtCfg.snapshotsForEmergency && sells >= droughtCfg.sellCountForEmergency) {
+            logger.warn(
+              `[positions] BUY DROUGHT EMERGENCY: ${shortenAddress(position.tokenMint)} ${count} snapshots no buys, ${sells} sells — selling`,
+            );
+            const retryAfter = this.sellRetryAfter.get(position.id) ?? 0;
+            if (now >= retryAfter) {
+              this.sellingPositions.add(position.id);
+              this.priceMonitor.pause();
+              this.executeStopLoss(position, 'trailing_stop')
+                .catch((err) => {
+                  logger.error(`[positions] Buy drought sell error: ${err}`);
+                  const retries = (this.sellRetries.get(position.id) ?? 0) + 1;
+                  this.sellRetries.set(position.id, retries);
+                  this.sellRetryAfter.set(position.id, Date.now() + PositionManager.SELL_RETRY_BASE_DELAY_MS * Math.pow(2, retries - 1));
+                })
+                .finally(() => {
+                  this.sellingPositions.delete(position.id);
+                  this.priceMonitor.resume();
+                  this.buyDroughtCount.delete(position.id);
+                  this.buyDroughtTightened.delete(position.id);
+                });
+              continue;
+            }
+          }
+          // Tighten trailing: 20s+ drought with moderate selling
+          else if (count >= droughtCfg.snapshotsForTighten && sells >= droughtCfg.sellCountForTighten
+            && !this.buyDroughtTightened.has(position.id)) {
+            logger.warn(
+              `[positions] BUY DROUGHT TIGHTEN: ${shortenAddress(position.tokenMint)} ${count} snapshots no buys, ${sells} sells — trailing ${this.config.position.trailingStopPct}%→${droughtCfg.tightenTrailingPct}%`,
+            );
+            this.buyDroughtTightened.add(position.id);
+          }
+        } else if (buys > 0) {
+          // Reset drought counter when buys resume
+          if (this.buyDroughtCount.has(position.id)) {
+            this.buyDroughtCount.delete(position.id);
+            this.buyDroughtTightened.delete(position.id);
+          }
+        }
+      }
+
       // Check stop loss
+      // v11u: Use tightened trailing if buy drought detected
+      const effectiveTrailing = this.buyDroughtTightened.has(position.id)
+        ? this.config.position.buyDrought.tightenTrailingPct
+        : this.config.position.trailingStopPct;
       const slAction = evaluateStopLoss(
         position,
         this.config.position.stopLossPct,
-        this.config.position.trailingStopPct,
+        effectiveTrailing,
         this.config.position.timeoutMinutes,
       );
       if (slAction.shouldSell) {
@@ -839,6 +1086,68 @@ export class PositionManager {
           `[positions] Dust skip TP${level + 1}: ${shortenAddress(position.tokenMint)} sell value ${formatSol(sellValue)} SOL < ${PositionManager.DUST_THRESHOLD_SOL} threshold`,
         );
         return;
+      }
+    }
+
+    // v11s: TP1 snapshot + smart TP evaluation
+    if (level === 0) {
+      const poolStr = position.poolAddress.toBase58();
+      const timeToTp1 = Date.now() - position.openedAt;
+      const entryRes = position.entryReserveLamports ?? null;
+      const currentRes = position.currentReserveLamports ?? null;
+      const reserveChangePct = (entryRes && currentRes && entryRes > 0)
+        ? ((currentRes - entryRes) / entryRes) * 100
+        : null;
+      const { buys: buyCount30s, sells: sellCount15s, ratio: buySellRatio } =
+        this.liqMonitor?.getBuySellRatio(poolStr) ?? { buys: 0, sells: 0, ratio: 0 };
+      const cumulativeSells = this.liqMonitor?.getCumulativeSellCount(poolStr) ?? 0;
+      const currentMultiplier = position.entryPrice > 0 ? position.currentPrice / position.entryPrice : 1;
+
+      // Evaluate smart TP (shadow or active)
+      const smartTpSignals: SmartTpSignals = {
+        reserveChangePct,
+        buySellRatio,
+        timeToTp1Ms: timeToTp1,
+        cumulativeSellCount: cumulativeSells,
+        positionSolValue: position.tokenAmount * position.currentPrice,
+        entryReserveLamports: position.entryReserveLamports,
+      };
+      const smartTpResult = evaluateSmartTp(smartTpSignals, this.config.position.smartTp);
+
+      logger.info(
+        `[positions] TP1 SNAPSHOT: ${shortenAddress(position.tokenMint)} | ` +
+        `reserve${reserveChangePct !== null ? (reserveChangePct >= 0 ? '+' : '') + reserveChangePct.toFixed(1) + '%' : '?'} | ` +
+        `ratio=${buySellRatio.toFixed(1)} (${buyCount30s}B/${sellCount15s}S) | ` +
+        `tp1_in=${(timeToTp1 / 1000).toFixed(0)}s | sells=${cumulativeSells} | ` +
+        `SMART TP: ${smartTpResult.isConfident ? 'CONFIDENT' : 'DEFAULT'} ${smartTpResult.sellPct}% (${smartTpResult.reason})`,
+      );
+
+      // Log snapshot to DB
+      this.tradeLogger.logTp1Snapshot({
+        positionId: position.id,
+        tokenMint: position.tokenMint.toBase58(),
+        timeToTp1Ms: timeToTp1,
+        entryReserveLamports: entryRes,
+        tp1ReserveLamports: currentRes,
+        reserveChangePct,
+        buyCount30s,
+        sellCount15s,
+        buySellRatio,
+        cumulativeSellCount: cumulativeSells,
+        currentMultiplier,
+        // Record decision based on SIGNALS only (ignoring position size) for data collection
+        smartTpDecision: smartTpResult.signalsPassed >= this.config.position.smartTp.minSignalsRequired ? 'HOLD' : 'SELL',
+        smartTpSignalsPassed: smartTpResult.signalsPassed,
+        smartTpReason: smartTpResult.reason,
+      });
+
+      // v11s: If smart TP is ENABLED (not shadow) and confident → override sell percentage
+      if (this.config.position.smartTp.enabled && smartTpResult.isConfident) {
+        sellPct = smartTpResult.sellPct;
+        sellAmount = calculateSellAmount(position.tokenAmount, sellPct);
+        logger.info(
+          `[positions] SMART TP ACTIVE: Selling ${sellPct}% (${100 - sellPct}% held for TP2@1.20x)`,
+        );
       }
     }
 
@@ -1091,6 +1400,8 @@ export class PositionManager {
     }
 
     if (result.success) {
+      setSellPriorityBoost(1); // v11w: reset priority boost on success
+
       // v11m: Zero-output guard for stop-loss path too — same bug as TP path (FtnWkqsa)
       // TX confirmed but swap returned 0 SOL = pool drained, tokens still in wallet
       if (result.outputAmount === 0 && reason !== 'rug_pull') {
@@ -1176,24 +1487,37 @@ export class PositionManager {
       // v8l: Detect 429 rate limit for longer backoff and more retries
       const is429 = result.error && /429|rate.limit|Too many/i.test(result.error);
 
-      // Exponential backoff: 2s, 4s normally. 30s for 429 errors (rate limits need real cooldown)
-      const backoffMs = is429
-        ? PositionManager.SL_429_BACKOFF_MS
-        : PositionManager.SELL_RETRY_BASE_DELAY_MS * Math.pow(2, retries);
-      this.sellRetryAfter.set(position.id, Date.now() + backoffMs);
-
-      // Pool drained (Custom:6001/6024 = zero output): retrying is pointless
+      // Pool drained (Custom:6001/6024 = zero output): retrying is pointless AFTER 2 quick retries
       // v9w: Added 'SOL output is 0', 'Pool has 0 SOL', 'Token balance is 0' — overnight 4/10 tokens stranded 7+ min retrying
       // v9z: Added Custom:6025 (PumpSwap pool closed/depleted — CUbA blocked all detection with infinite retries)
+      // v11w: Allow 2 fast retries on drained pools (pool may be partially drained, worth trying with higher fee)
       const isDrainedPool = result.error && /Custom[:(]600[1245]|Custom[:(]602[45]|ZeroBase|InsufficientOutput|SOL output is 0|Pool has 0 SOL|Token balance is 0/i.test(result.error);
-      if (reason === 'rug_pull' || isDrainedPool) {
-        const drainReason = isDrainedPool ? 'pool drained (no liquidity)' : 'rug pull';
+      const isEmergencyReason = /rug_pull|sell_burst_detected|liq_removal/.test(reason);
+
+      // Exponential backoff: 2s, 4s normally. 30s for 429 errors. 500ms flat for emergencies (rug/burst/liq).
+      // v11w: Emergency sells use fast fixed delay instead of exponential backoff
+      const backoffMs = is429
+        ? PositionManager.SL_429_BACKOFF_MS
+        : isEmergencyReason
+          ? PositionManager.EMERGENCY_SELL_RETRY_DELAY_MS
+          : PositionManager.SELL_RETRY_BASE_DELAY_MS * Math.pow(2, retries);
+      this.sellRetryAfter.set(position.id, Date.now() + backoffMs);
+
+      // v11w: Escalate priority fee on emergency sell retries to land TX faster
+      if (isEmergencyReason && newRetries <= 3) {
+        clearPriorityFeeCache(); // Force fresh fee estimation
+        setSellPriorityBoost(newRetries * 2); // 2x, 4x, 6x
+        logger.info(`[positions] Priority boost ${newRetries * 2}x for ${reason} retry #${newRetries}`);
+      }
+      if (isDrainedPool && newRetries >= 2) {
+        // Exhausted 2 fast retries on drained pool — give up
         logger.warn(
-          `[positions] ${drainReason}: sell failed for ${shortenAddress(position.tokenMint)} - closing as loss immediately`,
+          `[positions] Pool drained: sell failed for ${shortenAddress(position.tokenMint)} after ${newRetries} retries - closing as loss`,
         );
+        setSellPriorityBoost(1); // v11w: reset boost
         position.status = 'stopped';
         position.closedAt = Date.now();
-        position.exitReason = isDrainedPool ? 'pool_drained' : 'rug_pull';
+        position.exitReason = 'pool_drained';
         position.pnlSol = position.solReturned - position.solInvested;
         position.pnlPct =
           position.solInvested > 0
@@ -1210,6 +1534,7 @@ export class PositionManager {
         botEmitter.emit('positionClosed', position);
       // v8l: Allow more retries for 429 errors (recoverable, just need cooldown)
       } else if (newRetries >= (is429 ? PositionManager.MAX_SELL_RETRIES_429 : PositionManager.MAX_SELL_RETRIES)) {
+        setSellPriorityBoost(1); // v11w: reset priority boost
         const maxR = is429 ? PositionManager.MAX_SELL_RETRIES_429 : PositionManager.MAX_SELL_RETRIES;
         // v9i: If no successful sells, tokens are still in wallet — start stranded retry
         if ((position.sellSuccesses ?? 0) === 0 && !this.strandedTimers.has(position.id)) {
@@ -1238,6 +1563,7 @@ export class PositionManager {
    * Centralizes the close-as-loss logic to avoid duplication.
    */
   private forceCloseAsLoss(position: Position, exitReason: string): void {
+    setSellPriorityBoost(1); // v11w: reset priority boost
     position.status = 'stopped';
     position.closedAt = Date.now();
     position.exitReason = exitReason;
@@ -1255,6 +1581,8 @@ export class PositionManager {
     this.tpSellCooldownUntil.delete(position.id);
     this.tpSell429RetryCount.delete(position.id);
     this.creatorTransferPositions.delete(position.id);
+    this.earlyExitTickCount.delete(position.id);
+    this.earlyExitDanger.delete(position.id);
     botEmitter.emit('stopLossHit', position);
     botEmitter.emit('positionClosed', position);
   }
@@ -1409,6 +1737,10 @@ export class PositionManager {
     this.tpSellCooldownUntil.delete(positionId);
     this.tpSell429RetryCount.delete(positionId);
     this.creatorTransferPositions.delete(positionId);
+    this.buyDroughtCount.delete(positionId);
+    this.buyDroughtTightened.delete(positionId);
+    this.earlyExitTickCount.delete(positionId);
+    this.earlyExitDanger.delete(positionId);
   }
 
   async closeAll(): Promise<void> {
@@ -1434,6 +1766,71 @@ export class PositionManager {
 
     this.creatorTracker.updateOutcome(mint, position.pnlPct);
     this.tradeLogger.updateTokenAnalysisPnl(mint, position.pnlPct, true, true);
+
+    // v11s: Update TP1 snapshot outcome + send shadow Telegram notification
+    this.updateTp1OutcomeAndShadow(position);
+  }
+
+  /**
+   * v11s: If this position had a TP1 hit (snapshot exists), fill in the post-TP1 outcome
+   * and emit a shadow Telegram notification showing what smart TP would have done.
+   */
+  private updateTp1OutcomeAndShadow(position: Position): void {
+    if (!this.tradeLogger.hasTp1Snapshot(position.id)) return;
+
+    const peakMult = position.peakMultiplier ?? (position.entryPrice > 0 ? position.peakPrice / position.entryPrice : 1);
+    const durationMs = (position.closedAt ?? Date.now()) - position.openedAt;
+    this.tradeLogger.updateTp1Outcome(
+      position.id,
+      peakMult,
+      position.exitReason ?? 'unknown',
+      durationMs,
+    );
+
+    // Attach shadow data to position so formatTradeClosed can show it inline
+    try {
+      const snapshot = this.tradeLogger.getTp1Snapshot(position.id);
+      if (!snapshot) return;
+
+      const decision = snapshot.smart_tp_decision as string;
+      const signalsPassed = snapshot.smart_tp_signals_passed as number;
+      const confidentSellPct = this.config.position.smartTp.confidentSellPct;
+      const realPnl = position.pnlSol;
+      let delta = 0;
+
+      if (decision === 'HOLD') {
+        const tp1Mult = 1.08;
+        const solInvested = position.solInvested;
+        const tp1Portion = confidentSellPct / 100;
+        const holdPortion = 1 - tp1Portion;
+        const tp1PnlSol = solInvested * tp1Portion * (tp1Mult - 1);
+        const holdPnlSolAtPeak = solInvested * holdPortion * (peakMult - 1);
+        const extraFee = 0.0004;
+        const hypotheticalPnl = tp1PnlSol + holdPnlSolAtPeak - extraFee;
+        delta = hypotheticalPnl - realPnl;
+
+        logger.info(
+          `[positions] SMART TP SHADOW: ${shortenAddress(position.tokenMint)} | ` +
+          `decision=HOLD ${100 - confidentSellPct}% | signals=${signalsPassed}/4 | ` +
+          `peak=${peakMult.toFixed(2)}x | real=${realPnl.toFixed(4)} vs hypo=${hypotheticalPnl.toFixed(4)} | ` +
+          `delta=${delta >= 0 ? '+' : ''}${delta.toFixed(4)} SOL`,
+        );
+      } else {
+        logger.info(
+          `[positions] SMART TP SHADOW: ${shortenAddress(position.tokenMint)} | ` +
+          `decision=SELL 100% | signals=${signalsPassed}/4 | agrees with actual`,
+        );
+      }
+
+      // Attach to position — formatTradeClosed reads this
+      position.smartTpShadow = {
+        decision: decision === 'HOLD' ? 'HOLD' : 'SELL',
+        signalsPassed,
+        delta,
+      };
+    } catch (err) {
+      logger.debug(`[positions] Smart TP shadow error: ${err}`);
+    }
   }
 
   /**

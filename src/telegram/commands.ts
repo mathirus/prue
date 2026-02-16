@@ -1,7 +1,8 @@
 import { PublicKey } from '@solana/web3.js';
 import type { Context, Telegraf } from 'telegraf';
 import { logger } from '../utils/logger.js';
-import { formatPositionsList, formatStats, formatBalance, formatMultiPeriodStats } from './formatters.js';
+import { formatPositionsList, formatStats, formatBalance, formatMultiPeriodStats, formatDashboard } from './formatters.js';
+import type { DashboardData } from './formatters.js';
 import { mainMenuKeyboard, positionKeyboard } from './inline-keyboards.js';
 import { getAnalytics, getAnalyticsForHours } from '../data/analytics.js';
 import { TradeLogger } from '../data/trade-logger.js';
@@ -63,6 +64,7 @@ export function registerCommands(bot: Telegraf, deps: BotDeps): void {
     await ctx.reply(
       [
         '<b>Commands:</b>',
+        '/d - Dashboard (balance + trades + stats)',
         '/status - Bot status',
         '/balance - Wallet balance',
         '/positions - Open positions',
@@ -120,19 +122,59 @@ export function registerCommands(bot: Telegraf, deps: BotDeps): void {
       const h1Ago = now - 3600_000;
       const h6Ago = now - 6 * 3600_000;
       const h24Ago = now - 24 * 3600_000;
+      const vf = `AND bot_version >= 'v11o'`;
       const sessionStats = {
-        h1: db.prepare(`SELECT COALESCE(SUM(pnl_sol),0) as pnl, COUNT(*) as n, SUM(CASE WHEN pnl_sol>0 THEN 1 ELSE 0 END) as w, SUM(CASE WHEN exit_reason='rug_pull' THEN 1 ELSE 0 END) as r FROM positions WHERE opened_at>?`).get(h1Ago) as { pnl: number; n: number; w: number; r: number },
-        h6: db.prepare(`SELECT COALESCE(SUM(pnl_sol),0) as pnl, COUNT(*) as n, SUM(CASE WHEN pnl_sol>0 THEN 1 ELSE 0 END) as w, SUM(CASE WHEN exit_reason='rug_pull' THEN 1 ELSE 0 END) as r FROM positions WHERE opened_at>?`).get(h6Ago) as { pnl: number; n: number; w: number; r: number },
-        h24: db.prepare(`SELECT COALESCE(SUM(pnl_sol),0) as pnl, COUNT(*) as n, SUM(CASE WHEN pnl_sol>0 THEN 1 ELSE 0 END) as w, SUM(CASE WHEN exit_reason='rug_pull' THEN 1 ELSE 0 END) as r FROM positions WHERE opened_at>?`).get(h24Ago) as { pnl: number; n: number; w: number; r: number },
-        allTime: db.prepare(`SELECT COALESCE(SUM(pnl_sol),0) as pnl, COUNT(*) as n, SUM(CASE WHEN pnl_sol>0 THEN 1 ELSE 0 END) as w FROM positions`).get() as { pnl: number; n: number; w: number },
-        byVersion: db.prepare(`SELECT bot_version as v, COALESCE(SUM(pnl_sol),0) as pnl, COUNT(*) as n, SUM(CASE WHEN pnl_sol>0 THEN 1 ELSE 0 END) as w FROM positions WHERE opened_at>? GROUP BY bot_version ORDER BY MIN(opened_at)`).all(h24Ago) as Array<{ v: string; pnl: number; n: number; w: number }>,
-        openPnl: db.prepare(`SELECT COALESCE(SUM(pnl_sol),0) as pnl, COUNT(*) as n FROM positions WHERE status NOT IN ('stopped','closed')`).get() as { pnl: number; n: number },
+        h1: db.prepare(`SELECT COALESCE(SUM(pnl_sol),0) as pnl, COUNT(*) as n, SUM(CASE WHEN pnl_sol>0 THEN 1 ELSE 0 END) as w, SUM(CASE WHEN exit_reason='rug_pull' THEN 1 ELSE 0 END) as r FROM positions WHERE opened_at>? ${vf}`).get(h1Ago) as { pnl: number; n: number; w: number; r: number },
+        h6: db.prepare(`SELECT COALESCE(SUM(pnl_sol),0) as pnl, COUNT(*) as n, SUM(CASE WHEN pnl_sol>0 THEN 1 ELSE 0 END) as w, SUM(CASE WHEN exit_reason='rug_pull' THEN 1 ELSE 0 END) as r FROM positions WHERE opened_at>? ${vf}`).get(h6Ago) as { pnl: number; n: number; w: number; r: number },
+        h24: db.prepare(`SELECT COALESCE(SUM(pnl_sol),0) as pnl, COUNT(*) as n, SUM(CASE WHEN pnl_sol>0 THEN 1 ELSE 0 END) as w, SUM(CASE WHEN exit_reason='rug_pull' THEN 1 ELSE 0 END) as r FROM positions WHERE opened_at>? ${vf}`).get(h24Ago) as { pnl: number; n: number; w: number; r: number },
+        allTime: db.prepare(`SELECT COALESCE(SUM(pnl_sol),0) as pnl, COUNT(*) as n, SUM(CASE WHEN pnl_sol>0 THEN 1 ELSE 0 END) as w FROM positions WHERE 1=1 ${vf}`).get() as { pnl: number; n: number; w: number },
+        byVersion: db.prepare(`SELECT bot_version as v, COALESCE(SUM(pnl_sol),0) as pnl, COUNT(*) as n, SUM(CASE WHEN pnl_sol>0 THEN 1 ELSE 0 END) as w FROM positions WHERE opened_at>? ${vf} GROUP BY bot_version ORDER BY MIN(opened_at)`).all(h24Ago) as Array<{ v: string; pnl: number; n: number; w: number }>,
+        openPnl: db.prepare(`SELECT COALESCE(SUM(pnl_sol),0) as pnl, COUNT(*) as n FROM positions WHERE status NOT IN ('stopped','closed') ${vf}`).get() as { pnl: number; n: number },
       };
       await ctx.reply(formatBalance(balance, wallet.publicKey.toBase58(), history, sessionStats), {
         parse_mode: 'HTML',
       });
     } catch (err) {
       logger.error(`[telegram] /balance error: ${err}`);
+      await ctx.reply(`Error: ${String(err).slice(0, 200)}`);
+    }
+  });
+
+  // /d - Dashboard (balance + positions + recent trades)
+  bot.command('d', async (ctx) => {
+    logger.info(`[telegram] /d command received from user ${ctx.from?.id}`);
+    if (!requireAdmin(ctx)) return;
+    try {
+      const balance = await wallet.getBalance(rpcManager.connection);
+      const { getDb } = await import('../data/database.js');
+      const db = getDb();
+      const now = Date.now();
+      const h1Ago = now - 3600_000;
+      const h24Ago = now - 24 * 3600_000;
+
+      const vFilter = `AND bot_version >= 'v11o'`;
+      const h1 = db.prepare(`SELECT COALESCE(SUM(pnl_sol),0) as pnl, COUNT(*) as n, SUM(CASE WHEN pnl_sol>0 THEN 1 ELSE 0 END) as w, SUM(CASE WHEN exit_reason='rug_pull' THEN 1 ELSE 0 END) as r FROM positions WHERE opened_at>? AND status IN ('stopped','closed') ${vFilter}`).get(h1Ago) as { pnl: number; n: number; w: number; r: number };
+      const h24 = db.prepare(`SELECT COALESCE(SUM(pnl_sol),0) as pnl, COUNT(*) as n, SUM(CASE WHEN pnl_sol>0 THEN 1 ELSE 0 END) as w, SUM(CASE WHEN exit_reason='rug_pull' THEN 1 ELSE 0 END) as r FROM positions WHERE opened_at>? AND status IN ('stopped','closed') ${vFilter}`).get(h24Ago) as { pnl: number; n: number; w: number; r: number };
+      const byVersion = db.prepare(`SELECT bot_version as v, COALESCE(SUM(pnl_sol),0) as pnl, COUNT(*) as n, SUM(CASE WHEN pnl_sol>0 THEN 1 ELSE 0 END) as w FROM positions WHERE opened_at>? AND status IN ('stopped','closed') ${vFilter} GROUP BY bot_version ORDER BY MIN(opened_at)`).all(h24Ago) as Array<{ v: string; pnl: number; n: number; w: number }>;
+      const recentTrades = db.prepare(`SELECT token_mint as mint, pnl_pct as pnlPct, peak_multiplier as peakMultiplier, exit_reason as exitReason FROM positions WHERE status IN ('stopped','closed') ${vFilter} ORDER BY closed_at DESC LIMIT 5`).all() as Array<{ mint: string; pnlPct: number; peakMultiplier: number | null; exitReason: string | null }>;
+
+      // Get SOL price
+      let solPriceUsd = 0;
+      try {
+        const { getSolPriceUsd } = await import('../utils/helpers.js');
+        solPriceUsd = await getSolPriceUsd();
+      } catch { /* ignore */ }
+
+      const dashData: DashboardData = {
+        balance,
+        solPriceUsd,
+        openPositions: positionManager.openCount,
+        h1, h24, byVersion, recentTrades,
+      };
+
+      await ctx.reply(formatDashboard(dashData), { parse_mode: 'HTML' });
+    } catch (err) {
+      logger.error(`[telegram] /d error: ${err}`);
       await ctx.reply(`Error: ${String(err).slice(0, 200)}`);
     }
   });

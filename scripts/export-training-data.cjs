@@ -192,6 +192,19 @@ function exportEnrichedDataset(db) {
     ? `dp.dp_graduation_time_s, dp.dp_bundle_penalty, dp.dp_insiders_count,`
     : `NULL as dp_graduation_time_s, NULL as dp_bundle_penalty, NULL as dp_insiders_count,`;
 
+  // v11t: Penalty breakdown columns (available from v11o+, NULL for older pools)
+  const PENALTY_BREAKDOWN_COLS = [
+    'dp_holder_penalty', 'dp_rugcheck_penalty', 'dp_graduation_bonus',
+    'dp_obs_bonus', 'dp_organic_bonus', 'dp_smart_wallet_bonus',
+    'dp_creator_age_penalty', 'dp_velocity_penalty', 'dp_insider_penalty',
+    'dp_whale_penalty', 'dp_timing_cv_penalty', 'dp_hhi_penalty',
+    'dp_concentrated_penalty', 'dp_funder_fan_out', 'dp_creator_reputation',
+  ];
+  const hasPenaltyCols = dpCols.includes('dp_holder_penalty');
+  const penaltySelect = hasPenaltyCols
+    ? PENALTY_BREAKDOWN_COLS.map(c => `dp.${c}`).join(', ') + ','
+    : PENALTY_BREAKDOWN_COLS.map(c => `NULL as ${c}`).join(', ') + ',';
+
   const rows = db.prepare(`
     SELECT
       dp.id,
@@ -205,6 +218,7 @@ function exportEnrichedDataset(db) {
       dp.detected_at,
       ${featureSelect}
       ${v8lSelectEnriched}
+      ${penaltySelect}
       ta.liquidity_usd as ta_liquidity_usd,
       ta.top_holder_pct as ta_top_holder_pct,
       ta.holder_count as ta_holder_count,
@@ -266,6 +280,8 @@ function exportEnrichedDataset(db) {
     'lp_burned',
     // v8l features
     'graduation_time_s', 'bundle_penalty', 'insiders_count',
+    // v11t: Penalty breakdown features (NULL for pre-v11o pools)
+    ...PENALTY_BREAKDOWN_COLS,
     // Pool state
     'current_sol_reserves', 'detection_latency_ms',
     // Label
@@ -323,6 +339,11 @@ function exportEnrichedDataset(db) {
       r.dp_graduation_time_s ?? '',
       r.dp_bundle_penalty ?? '',
       r.dp_insiders_count ?? '',
+      // v11t: Penalty breakdown features
+      ...PENALTY_BREAKDOWN_COLS.map(col => {
+        const val = r[col];
+        return val != null ? csvEscape(val) : '';
+      }),
       r.current_sol_reserves ?? '',
       r.detection_latency_ms ?? '',
       csvEscape(r.pool_outcome ?? ''),

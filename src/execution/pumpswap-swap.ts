@@ -32,10 +32,27 @@ import type { Wallet } from '../core/wallet.js';
 import type { TradeResult, DetectedPool } from '../types.js';
 import { getCachedBlockhash } from '../utils/blockhash-cache.js';
 import { pollConfirmation } from '../utils/confirm-tx.js';
+import { getCachedBalanceLamports } from '../utils/balance-cache.js';
 
 // Dynamic priority fee cache (TTL 10s — fees don't change drastically between blocks)
 let cachedPriorityFee: { fee: number; timestamp: number } | null = null;
 const PRIORITY_FEE_CACHE_TTL_MS = 10_000;
+
+// v11w: Sell priority boost — escalate fees on rug sell retries to land TX faster
+let sellPriorityBoostMultiplier = 1;
+
+/** v11w: Set multiplier for sell priority fee (1x = normal, 2x = double, etc.) */
+export function setSellPriorityBoost(multiplier: number): void {
+  sellPriorityBoostMultiplier = Math.max(1, multiplier);
+  if (multiplier > 1) {
+    logger.info(`[pumpswap] Sell priority boost set to ${multiplier}x`);
+  }
+}
+
+/** v11w: Clear cached priority fee to force fresh estimation on retry */
+export function clearPriorityFeeCache(): void {
+  cachedPriorityFee = null;
+}
 
 async function getDynamicPriorityFee(
   connection: Connection,
@@ -92,20 +109,20 @@ const sellBackupConnections = SELL_BACKUP_RPCS.map(url => new Connection(url, 'c
 logger.info(`[pumpswap] Sell backup RPCs: ${SELL_BACKUP_RPCS.length} endpoints (${SELL_BACKUP_RPCS.length - 2} paid + 2 public)`);
 
 // v11g: Helius Sender URL (staked connections, SWQOS-only)
-let _senderUrl: string | null | undefined;
-function getSenderUrl(): string | null {
-  if (_senderUrl === undefined) {
-    // Try HELIUS_API_KEY first, then extract from RPC_URL
-    let key = process.env.HELIUS_API_KEY;
-    if (!key) {
-      const rpcUrl = process.env.RPC_URL || '';
-      const match = rpcUrl.match(/api-key=([a-f0-9-]+)/i);
-      if (match) key = match[1];
-    }
-    _senderUrl = key ? `https://sender.helius-rpc.com/fast?api-key=${key}&swqos_only=true` : null;
-    if (_senderUrl) logger.info(`[pumpswap] Helius Sender endpoint configured`);
-    else logger.warn(`[pumpswap] Helius Sender endpoint NOT configured (no API key found)`);
+// v11u: Eagerly initialized at module load (was lazy on first buy, added ~20ms to hot path)
+let _senderUrl: string | null;
+{
+  let key = process.env.HELIUS_API_KEY;
+  if (!key) {
+    const rpcUrl = process.env.RPC_URL || '';
+    const match = rpcUrl.match(/api-key=([a-f0-9-]+)/i);
+    if (match) key = match[1];
   }
+  _senderUrl = key ? `https://sender.helius-rpc.com/fast?api-key=${key}&swqos_only=true` : null;
+  if (_senderUrl) logger.info(`[pumpswap] Helius Sender endpoint configured`);
+  else logger.warn(`[pumpswap] Helius Sender endpoint NOT configured (no API key found)`);
+}
+function getSenderUrl(): string | null {
   return _senderUrl;
 }
 
@@ -271,7 +288,8 @@ export class PumpSwapSwap {
       if (feePayerStr === PUMPSWAP_AMM.toBase58()) return null;
       if (feePayerStr === PUMPFUN_PROGRAM.toBase58()) return null;
 
-      logger.info(`[pumpswap] coinCreator from pool TX fee payer: ${feePayerStr.slice(0, 8)}...`);
+      // v11u: Demoted to debug (creator address already in [creator-deep] line)
+      logger.debug(`[pumpswap] coinCreator from pool TX fee payer: ${feePayerStr.slice(0, 8)}...`);
       return feePayerStr;
     } catch (err) {
       logger.debug(`[pumpswap] Pool TX creator lookup failed (non-fatal): ${err}`);
@@ -285,7 +303,7 @@ export class PumpSwapSwap {
     if (cached && (Date.now() - cached.timestamp) < PumpSwapSwap.CACHE_TTL_MS) {
       // Don't delete yet - observation window may have used it and buy still needs it
       // Cache auto-expires after CACHE_TTL_MS (30s)
-      logger.info(`[pumpswap] Using prefetched pool state (saved ~600ms)`);
+      logger.debug(`[pumpswap] Using prefetched pool state (saved ~600ms)`);
       return cached.state;
     }
     this.poolStateCache.delete(key); // Expired
@@ -394,11 +412,12 @@ export class PumpSwapSwap {
         getAssociatedTokenAddress(feeMint, creatorVaultAuthority, true, TOKEN_PROGRAM_ID),
       ]);
 
-      // ONE big parallel fetch: vaults (for reserves + Token Program) + ATAs + blockhash
+      // ONE big parallel fetch: vaults (for reserves + Token Program) + ATAs + blockhash + priority fee
       // Merges what was 2 separate RPC rounds into 1
       // v8s: blockhash from pre-cache (0ms vs 100-300ms RPC call)
       // v9h: Use analysis RPCs for batch fetch to avoid 429 on Helius primary
-      const [batchAccountInfos, blockInfo] = await Promise.all([
+      // v11u: Priority fee fetched in parallel (was sequential after batch, saves ~40ms)
+      const [batchAccountInfos, blockInfo, buyPriorityFee] = await Promise.all([
         withAnalysisRetry(
           (conn) => conn.getMultipleAccountsInfo([
             poolState.poolBaseTokenAccount,   // [0] baseVault → reserves + Token Program
@@ -411,6 +430,7 @@ export class PumpSwapSwap {
           this.connection,
         ),
         getCachedBlockhash(this.connection),
+        getDynamicPriorityFee(this.connection, 200_000),
       ]);
 
       // Parse reserves from vault accounts
@@ -477,7 +497,9 @@ export class PumpSwapSwap {
         const totalAtaCost = atasToCreate * ATA_RENT;
         const irrecoverableCost = irrecoverableAtas * ATA_RENT;
         const totalNeeded = amountInLamports + 500_000 + totalAtaCost + 300_000; // trade + wrap buffer + ATAs + fees
-        const userBalance = await this.connection.getBalance(this.wallet.publicKey);
+        // v11u: Use cached balance (saves ~100-200ms RPC call). Simulation catches real balance issues.
+        const cachedBal = getCachedBalanceLamports();
+        const userBalance = cachedBal ?? await this.connection.getBalance(this.wallet.publicKey);
         if (userBalance < totalNeeded) {
           const needed = (totalNeeded / 1e9).toFixed(4);
           const have = (userBalance / 1e9).toFixed(4);
@@ -528,9 +550,7 @@ export class PumpSwapSwap {
       // Step 6: Build transaction
       const transaction = new Transaction();
 
-      // Dynamic priority fees (v8l): adapts to network congestion
-      // Fallback: 200K µLamports if RPC doesn't support getPriorityFeeEstimate
-      const buyPriorityFee = await getDynamicPriorityFee(this.connection, 200_000);
+      // v11u: buyPriorityFee already fetched in parallel above (was sequential here)
       transaction.add(
         ComputeBudgetProgram.setComputeUnitLimit({ units: 300_000 }),
         ComputeBudgetProgram.setComputeUnitPrice({ microLamports: buyPriorityFee }),
@@ -734,7 +754,13 @@ export class PumpSwapSwap {
         pricePerToken,
         fee: 5000,
         timestamp: Date.now(),
-        poolReserves: { solLamports: solReserve },
+        poolReserves: {
+          solLamports: solReserve,
+          // v11t: Pass vault addresses for PriceMonitor pre-caching (saves 1 poll cycle)
+          baseVault: poolState.poolBaseTokenAccount.toBase58(),
+          quoteVault: poolState.poolQuoteTokenAccount.toBase58(),
+          isReversed,
+        },
         ataOverheadLamports: ataOverhead,
       };
     } catch (err: unknown) {
@@ -1123,7 +1149,10 @@ export class PumpSwapSwap {
 
       // Dynamic priority fees for sell (v8l): adapts to network congestion
       // Fallback: 150K µLamports if RPC doesn't support getPriorityFeeEstimate
-      const sellPriorityFee = await getDynamicPriorityFee(this.connection, 150_000);
+      // v11w: Apply priority boost multiplier for rug sell retries (escalates to land TX faster)
+      const baseSellPriorityFee = await getDynamicPriorityFee(this.connection, 150_000);
+      const maxClamp = sellPriorityBoostMultiplier > 1 ? 2_000_000 : 500_000; // v11w: 2M max when boosted
+      const sellPriorityFee = Math.min(maxClamp, Math.round(baseSellPriorityFee * sellPriorityBoostMultiplier));
       transaction.add(
         ComputeBudgetProgram.setComputeUnitLimit({ units: 300_000 }),
         ComputeBudgetProgram.setComputeUnitPrice({ microLamports: sellPriorityFee }),
@@ -1385,7 +1414,8 @@ export class PumpSwapSwap {
       const coinCreator = new PublicKey(data.slice(POOL_LAYOUT.coinCreator, POOL_LAYOUT.coinCreator + 32));
       const baseMintIsWsol = baseMint.equals(WSOL_MINT);
 
-      logger.info(`[pumpswap] Pool state: base=${baseMint.toBase58().slice(0, 8)} quote=${quoteMint.toBase58().slice(0, 8)} reversed=${baseMintIsWsol} coinCreator=${coinCreator.toBase58().slice(0, 8)}`);
+      // v11u: Demoted to debug (logged 2x per pool, always same format)
+      logger.debug(`[pumpswap] Pool state: base=${baseMint.toBase58().slice(0, 8)} quote=${quoteMint.toBase58().slice(0, 8)} reversed=${baseMintIsWsol} coinCreator=${coinCreator.toBase58().slice(0, 8)}`);
 
       return {
         creator: new PublicKey(data.slice(POOL_LAYOUT.creator, POOL_LAYOUT.creator + 32)),
@@ -1586,7 +1616,7 @@ export class PumpSwapSwap {
           .then(async (res) => {
             const data = (await res.json()) as { error?: { message: string }; result?: string };
             if (data.error) throw new Error(data.error.message);
-            logger.info(`[pumpswap] Sender endpoint success`);
+            logger.debug(`[pumpswap] Sender endpoint success`);
             onResult(data.result as string);
           })
           .catch((e) => {

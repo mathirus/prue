@@ -362,6 +362,13 @@ export class TokenScorer {
       }
     }
 
+    // v11w: Holder killshot — hard rejection if below min_holders (blocks 5/12 rugs, saves +0.043 SOL)
+    const minHolders = this.config.analysis.minHolders;
+    if (minHolders > 0 && isPumpSwap && hold.holderCount !== -1 && hold.holderCount < minHolders) {
+      score -= 100;
+      logger.warn(`[scorer] 🚨 HOLDER KILLSHOT: ${hold.holderCount} holders < min ${minHolders} → BLOCKED`);
+    }
+
     // Low holder count penalty (PumpSwap only) - LIQUIDITY-WEIGHTED
     // v11o: Reduced — fresh pools always have few holders, doesn't discriminate (was -25/-15/-5, now -8/-5/-2)
     if (isPumpSwap && hold.holderCount === -1) {
@@ -377,8 +384,8 @@ export class TokenScorer {
         score -= 8;
         logger.warn(`[scorer] ⚠️ SOLO HOLDER: ${hold.holderCount} (penalty: -8, liq: $${Math.round(liq.liquidityUsd)})`);
       } else if (hold.holderCount < 5) {
-        score -= 5;
-        logger.warn(`[scorer] ⚠️ Very few holders: ${hold.holderCount} (penalty: -5, liq: $${Math.round(liq.liquidityUsd)})`);
+        score -= 10; // v11r: raised from -5 (yzo37DNQ rug: 3 holders, top 81%, score 67 → passed)
+        logger.warn(`[scorer] ⚠️ Very few holders: ${hold.holderCount} (penalty: -10, liq: $${Math.round(liq.liquidityUsd)})`);
       } else if (hold.holderCount < 10) {
         score -= 2;
         logger.warn(`[scorer] ⚠️ Low holder count: ${hold.holderCount} (penalty: -2, liq: $${Math.round(liq.liquidityUsd)})`);
@@ -423,7 +430,13 @@ export class TokenScorer {
       const relevantDangers = isPumpSwap
         ? dangerRisks.filter(r => !PUMPSWAP_FALSE_POSITIVE_DANGERS.some(fp => r.includes(fp)))
         : dangerRisks;
-      if (relevantDangers.length > 0) {
+      // v11q: "Creator history of rugged tokens" → instant kill (was hidden by -5 + +5 netting to 0)
+      const creatorRugHistory = relevantDangers.some(r => r.includes('Creator history of rugged'));
+      if (creatorRugHistory) {
+        score -= 100;
+        logger.warn(`[scorer] 🚨 RugCheck: Creator has history of rugged tokens → BLOCKED`);
+      }
+      if (relevantDangers.length > 0 && !creatorRugHistory) {
         score -= Math.min(15, relevantDangers.length * 5); // -5 per danger risk, max -15
         logger.warn(`[scorer] RugCheck dangers: ${relevantDangers.join(', ')}${dangerRisks.length > relevantDangers.length ? ` (ignored ${dangerRisks.length - relevantDangers.length} PumpSwap-universal)` : ''}`);
       }
@@ -807,6 +820,13 @@ export class TokenScorer {
       }
     }
 
+    // v11w: Holder killshot — hard rejection if below min_holders
+    const minHolders = this.config.analysis.minHolders;
+    if (minHolders > 0 && isPumpSwap && hold.holderCount !== -1 && hold.holderCount < minHolders) {
+      delta -= 100;
+      logger.warn(`[scorer-deferred] 🚨 HOLDER KILLSHOT: ${hold.holderCount} holders < min ${minHolders} → BLOCKED`);
+    }
+
     // Low holder count penalty
     // v11o: Reduced — fresh pools always have few holders, doesn't discriminate (was -25/-15/-5, now -8/-5/-2)
     let holderPenalty = 0;
@@ -826,7 +846,7 @@ export class TokenScorer {
         delta -= holderPenalty;
         logger.warn(`[scorer-deferred] SOLO HOLDER: ${hold.holderCount} (-${holderPenalty}, liq: $${Math.round(liqUsd)})`);
       } else if (hold.holderCount < 5) {
-        holderPenalty = 5;
+        holderPenalty = 10; // v11r: raised from -5 (yzo37DNQ rug: 3 holders, top 81%)
         delta -= holderPenalty;
         logger.warn(`[scorer-deferred] Very few holders: ${hold.holderCount} (-${holderPenalty})`);
       } else if (hold.holderCount < 10) {
@@ -859,7 +879,14 @@ export class TokenScorer {
       const relevantDangers = isPumpSwap
         ? dangerRisks.filter(r => !PUMPSWAP_FALSE_POSITIVE_DANGERS.some(fp => r.includes(fp)))
         : dangerRisks;
-      if (relevantDangers.length > 0) {
+      // v11q: "Creator history of rugged tokens" → instant kill
+      const creatorRugHistory = relevantDangers.some(r => r.includes('Creator history of rugged'));
+      if (creatorRugHistory) {
+        rugcheckPenalty += 100;
+        delta -= 100;
+        logger.warn(`[scorer-deferred] 🚨 RugCheck: Creator has history of rugged tokens → BLOCKED`);
+      }
+      if (relevantDangers.length > 0 && !creatorRugHistory) {
         const dangerPen = Math.min(15, relevantDangers.length * 5);
         rugcheckPenalty += dangerPen;
         delta -= dangerPen;
@@ -1008,6 +1035,7 @@ export class TokenScorer {
         insiderPenalty: -insiderPenalty,
         whalePenalty: -whalePenalty,
         timingCvPenalty: -timingCvPenalty,
+        networkRugPenalty: 0,  // filled in index.ts
       },
     };
 

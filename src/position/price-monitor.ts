@@ -103,6 +103,8 @@ export class PriceMonitor {
     source?: string,
     initialSolReserve?: number,
     initialAuthorities?: { mintRevoked: boolean; freezeRevoked: boolean },
+    // v11t: Pre-cached vault addresses from buy (saves 1 poll cycle = 1.5s for first price read)
+    vaultCache?: { baseVault: PublicKey; quoteVault: PublicKey; isReversed: boolean },
   ): void {
     const key = mint.toBase58();
     if (!this.monitoredTokens.has(key)) {
@@ -120,8 +122,13 @@ export class PriceMonitor {
         token.initialMintAuthRevoked = initialAuthorities.mintRevoked;
         token.initialFreezeAuthRevoked = initialAuthorities.freezeRevoked;
       }
+      // v11t: Pre-cache vault addresses from buy result (skip pool account fetch on first poll)
+      if (vaultCache) {
+        token.cachedVaults = vaultCache;
+        logger.debug(`[price] Pre-cached vaults from buy (saves 1 poll cycle)`);
+      }
       this.monitoredTokens.set(key, token);
-      logger.debug(`[price] Monitoring ${key.slice(0, 8)}... (pool=${poolAddress?.toBase58().slice(0, 8) ?? 'none'}, source=${source ?? 'unknown'})`);
+      logger.debug(`[price] Monitoring ${key.slice(0, 8)}... (pool=${poolAddress?.toBase58().slice(0, 8) ?? 'none'}, source=${source ?? 'unknown'}, vaults=${vaultCache ? 'pre-cached' : 'pending'})`);
     }
   }
 
@@ -156,6 +163,44 @@ export class PriceMonitor {
   /** Resume polling after sell completes */
   resume(): void {
     this.paused = false;
+  }
+
+  /**
+   * v11q: Fetch reserves for a single pool immediately (1 RPC call).
+   * Used by conditional grace: when sell burst happens during grace period,
+   * fetch reserves on-demand instead of waiting for next poll cycle.
+   * Returns SOL reserve in lamports, or null on failure.
+   */
+  async fetchSinglePoolReserves(mint: string): Promise<number | null> {
+    const token = this.monitoredTokens.get(mint);
+    if (!token || !token.poolAddress || !this.connection) return null;
+
+    try {
+      // If vaults not cached yet, fetch pool account to get vault addresses
+      if (!token.cachedVaults) {
+        const poolInfo = await this.connection.getAccountInfo(token.poolAddress);
+        if (!poolInfo || poolInfo.data.length < 203) return null;
+        const baseMint = new PublicKey(poolInfo.data.slice(POOL_BASE_MINT_OFFSET, POOL_BASE_MINT_OFFSET + 32));
+        token.cachedVaults = {
+          baseVault: new PublicKey(poolInfo.data.slice(POOL_BASE_VAULT_OFFSET, POOL_BASE_VAULT_OFFSET + 32)),
+          quoteVault: new PublicKey(poolInfo.data.slice(POOL_QUOTE_VAULT_OFFSET, POOL_QUOTE_VAULT_OFFSET + 32)),
+          isReversed: baseMint.equals(WSOL_MINT),
+        };
+      }
+
+      const solVault = token.cachedVaults.isReversed
+        ? token.cachedVaults.baseVault
+        : token.cachedVaults.quoteVault;
+
+      const vaultInfo = await this.connection.getAccountInfo(solVault);
+      if (!vaultInfo) return null;
+
+      const solReserve = Number(vaultInfo.data.readBigUInt64LE(64));
+      return solReserve > 0 ? solReserve : null;
+    } catch (err) {
+      logger.debug(`[price] fetchSinglePoolReserves failed for ${mint.slice(0, 8)}: ${err}`);
+      return null;
+    }
   }
 
   private async pollPrices(): Promise<void> {

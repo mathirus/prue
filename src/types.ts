@@ -43,6 +43,7 @@ export interface BotConfig {
   };
   analysis: {
     minScore: number;
+    minHolders: number;  // v11w: killshot threshold — pools with fewer holders rejected instantly
     weights: SecurityWeights;
     minLiquidityUsd: number;
     maxSingleHolderPct: number;
@@ -83,6 +84,23 @@ export interface BotConfig {
     moonBagPct: number;
     pricePollMs: number;
     timeoutMinutes: number;
+    smartTp: SmartTpConfig;
+    // v11u: Micro trailing — tight trailing in first 60s to catch ultra-fast rugs
+    microTrailing: {
+      enabled: boolean;
+      windowMs: number;            // First N ms of position (60000 = 60s)
+      minPeakMultiplier: number;   // Peak must be at least this (1.01 = 1%)
+      dropFromPeakPct: number;     // Sell if price drops this % from peak (3%)
+    };
+    // v11u: Buy drought detector — detect dead demand
+    buyDrought: {
+      enabled: boolean;
+      snapshotsForTighten: number;   // Consecutive 0-buy snapshots to tighten trailing (2)
+      sellCountForTighten: number;   // Min sells to trigger tighten (5)
+      tightenTrailingPct: number;    // Reduced trailing stop % (5)
+      snapshotsForEmergency: number; // Consecutive 0-buy snapshots for emergency sell (3)
+      sellCountForEmergency: number; // Min sells for emergency (10)
+    };
   };
   risk: {
     maxPositionSol: number;
@@ -94,6 +112,7 @@ export interface BotConfig {
     shadowMaxConcurrent: number;
     shadowTimeoutMinutes: number;
     shadowPollMs: number;
+    pauseOnRug: boolean;
   };
   copyTrading: {
     enabled: boolean;
@@ -116,6 +135,19 @@ export interface SecurityWeights {
 export interface TakeProfitLevel {
   pct: number;
   atMultiplier: number;
+}
+
+// v11s: Smart TP1 configuration — decides how much to sell at TP1 based on confidence signals
+export interface SmartTpConfig {
+  enabled: boolean;               // false = shadow mode (log but sell 100%)
+  minPositionSol: number;         // Below this, always 100% sell (fees eat hold)
+  defaultSellPct: number;         // Baseline: 100%
+  confidentSellPct: number;       // When signals positive: 60% (hold 40%)
+  minReserveGrowthPct: number;    // Reserve grew X%+ since entry
+  maxBuySellRatio: number;        // Sell/buy ratio below this
+  maxTimeToTp1Ms: number;         // Reached TP1 within this time
+  maxCumulativeSells: number;     // Low total sell pressure
+  minSignalsRequired: number;     // Need N+ signals to be confident
 }
 
 // ─── Detection ───────────────────────────────────────────────────────
@@ -163,6 +195,7 @@ export interface ScoringBreakdown {
   insiderPenalty: number;
   whalePenalty: number;
   timingCvPenalty: number;
+  networkRugPenalty: number; // v11y: penalty from pool_outcome network rug history
 }
 
 export interface SecurityResult {
@@ -235,7 +268,7 @@ export interface TradeResult {
   slot?: number;
   timestamp: number;
   error?: string;
-  poolReserves?: { solLamports: number };
+  poolReserves?: { solLamports: number; baseVault?: string; quoteVault?: string; isReversed?: boolean };
   ataOverheadLamports?: number; // v8t: irrecoverable ATA rent paid for others
 }
 
@@ -281,6 +314,12 @@ export interface Position {
   currentReserveLamports?: number; // latest known SOL reserve (updated each price poll)
   // v8p: Entry timing
   entryLatencyMs?: number;   // detection → buy execution time in ms
+  // v11s: Smart TP shadow data (attached before positionClosed emit)
+  smartTpShadow?: {
+    decision: 'HOLD' | 'SELL';
+    signalsPassed: number;
+    delta: number;            // hypothetical PnL - real PnL (positive = smart TP better)
+  };
 }
 
 // ─── Copy Trading ────────────────────────────────────────────────────

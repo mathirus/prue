@@ -10,6 +10,16 @@ export interface CreatorHistory {
   isRepeatRugger: boolean; // true if creator has 2+ rugs
 }
 
+// v11y: Network rug history from pool_outcome data (zero RPC, pure SQLite)
+export interface NetworkRugResult {
+  creatorPriorRugs: number;
+  funderPriorRugs: number;
+  funderHop2PriorRugs: number;
+  penalty: number;
+  reason: string | null;
+  shouldBlock: boolean;
+}
+
 export class CreatorTracker {
   /**
    * Record a new (creator, token) pair when a pool is detected.
@@ -157,6 +167,95 @@ export class CreatorTracker {
       logger.debug(`[creator-tracker] Failed to get creators by funding source: ${err}`);
       return [];
     }
+  }
+
+  /**
+   * v11y: Check network rug history using pool_outcome data.
+   * Looks up if this creator, funder, or funder_hop2 has prior rugs in detected_pools.
+   * Zero RPC calls — pure SQLite JOINs. <1ms.
+   */
+  getNetworkRugHistory(
+    creatorWallet: string,
+    fundingSource: string | null,
+    fundingSourceHop2: string | null,
+  ): NetworkRugResult {
+    const result: NetworkRugResult = {
+      creatorPriorRugs: 0,
+      funderPriorRugs: 0,
+      funderHop2PriorRugs: 0,
+      penalty: 0,
+      reason: null,
+      shouldBlock: false,
+    };
+
+    try {
+      const db = getDb();
+
+      // 1. Creator prior rugs: other tokens by same creator with pool_outcome='rug'
+      const creatorRow = db.prepare(`
+        SELECT COUNT(*) as cnt FROM token_creators tc
+        JOIN detected_pools dp ON tc.token_mint = dp.base_mint
+        WHERE tc.creator_wallet = ? AND dp.pool_outcome = 'rug'
+      `).get(creatorWallet) as { cnt: number } | undefined;
+      result.creatorPriorRugs = creatorRow?.cnt ?? 0;
+
+      // 2. Funder prior rugs: other creators funded by same funder with pool_outcome='rug'
+      if (fundingSource) {
+        const funderRow = db.prepare(`
+          SELECT COUNT(DISTINCT tc.creator_wallet) as cnt FROM token_creators tc
+          JOIN detected_pools dp ON tc.token_mint = dp.base_mint
+          WHERE tc.funding_source = ? AND dp.pool_outcome = 'rug'
+            AND tc.creator_wallet != ?
+        `).get(fundingSource, creatorWallet) as { cnt: number } | undefined;
+        result.funderPriorRugs = funderRow?.cnt ?? 0;
+      }
+
+      // 3. Funder hop2 prior rugs: same as above but for 2nd-hop funder
+      if (fundingSourceHop2) {
+        const hop2Row = db.prepare(`
+          SELECT COUNT(DISTINCT tc.creator_wallet) as cnt FROM token_creators tc
+          JOIN detected_pools dp ON tc.token_mint = dp.base_mint
+          WHERE tc.funding_source_hop2 = ? AND dp.pool_outcome = 'rug'
+            AND tc.creator_wallet != ?
+        `).get(fundingSourceHop2, creatorWallet) as { cnt: number } | undefined;
+        result.funderHop2PriorRugs = hop2Row?.cnt ?? 0;
+      }
+
+      // Compute penalty and block decision
+      if (result.creatorPriorRugs >= 2) {
+        result.penalty = -25;
+        result.reason = `creator ${creatorWallet.slice(0, 8)} has ${result.creatorPriorRugs} prior rugs (pool_outcome)`;
+        result.shouldBlock = true;
+      } else if (result.funderPriorRugs >= 3) {
+        result.penalty = -25;
+        result.reason = `funder ${fundingSource!.slice(0, 8)} funded ${result.funderPriorRugs} creators with rugs`;
+        result.shouldBlock = true;
+      } else {
+        // Accumulate softer penalties
+        if (result.creatorPriorRugs === 1) {
+          result.penalty -= 10;
+          result.reason = `creator has 1 prior rug (pool_outcome)`;
+        }
+        if (result.funderPriorRugs >= 1) {
+          result.penalty -= 10;
+          const funderReason = `funder has ${result.funderPriorRugs} rug-creators`;
+          result.reason = result.reason ? `${result.reason}, ${funderReason}` : funderReason;
+        }
+        if (result.funderHop2PriorRugs >= 3) {
+          result.penalty -= 15;
+          const hop2Reason = `funder_hop2 has ${result.funderHop2PriorRugs} rug-creators`;
+          result.reason = result.reason ? `${result.reason}, ${hop2Reason}` : hop2Reason;
+        }
+        // Block if accumulated penalty is severe enough
+        if (result.penalty <= -25) {
+          result.shouldBlock = true;
+        }
+      }
+    } catch (err) {
+      logger.debug(`[creator-tracker] Network rug history check failed: ${err}`);
+    }
+
+    return result;
   }
 
   getTopRuggers(limit = 10): Array<{ creator_wallet: string; rug_count: number; total_tokens: number }> {

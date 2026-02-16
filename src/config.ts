@@ -2,7 +2,7 @@ import { readFileSync } from 'fs';
 import { resolve } from 'path';
 import { parse as parseYaml } from 'yaml';
 import { config as dotenvConfig } from 'dotenv';
-import type { BotConfig, TakeProfitLevel, SecurityWeights } from './types.js';
+import type { BotConfig, TakeProfitLevel, SecurityWeights, SmartTpConfig } from './types.js';
 
 dotenvConfig();
 
@@ -101,6 +101,7 @@ export function loadConfig(): BotConfig {
     },
     analysis: {
       minScore: (analysis.min_score as number) ?? 60,
+      minHolders: (analysis.min_holders as number) ?? 0,  // v11w: 0 = disabled
       weights: {
         freezeAuthority: analysisWeights.freeze_authority ?? 20,
         mintAuthority: analysisWeights.mint_authority ?? 20,
@@ -162,6 +163,42 @@ export function loadConfig(): BotConfig {
       moonBagPct: (position.moon_bag_pct as number) ?? 0,
       pricePollMs: (position.price_poll_ms as number) ?? 2000,
       timeoutMinutes: (position.timeout_minutes as number) ?? 30,
+      smartTp: (() => {
+        const stp = (position.smart_tp ?? {}) as Record<string, unknown>;
+        return {
+          enabled: (stp.enabled as boolean) ?? false,
+          minPositionSol: (stp.min_position_sol as number) ?? 0.010,
+          defaultSellPct: (stp.default_sell_pct as number) ?? 100,
+          confidentSellPct: (stp.confident_sell_pct as number) ?? 60,
+          minReserveGrowthPct: (stp.min_reserve_growth_pct as number) ?? 5,
+          maxBuySellRatio: (stp.max_buy_sell_ratio as number) ?? 1.5,
+          maxTimeToTp1Ms: (stp.max_time_to_tp1_ms as number) ?? 15000,
+          maxCumulativeSells: (stp.max_cumulative_sells as number) ?? 20,
+          minSignalsRequired: (stp.min_signals_required as number) ?? 2,
+        } satisfies SmartTpConfig;
+      })(),
+      // v11u: Micro trailing — tight trailing in first 60s to catch ultra-fast rugs
+      microTrailing: (() => {
+        const mt = (position.micro_trailing ?? {}) as Record<string, unknown>;
+        return {
+          enabled: (mt.enabled as boolean) ?? true,
+          windowMs: (mt.window_ms as number) ?? 60_000,
+          minPeakMultiplier: (mt.min_peak_multiplier as number) ?? 1.01,
+          dropFromPeakPct: (mt.drop_from_peak_pct as number) ?? 3,
+        };
+      })(),
+      // v11u: Buy drought detector — detect dead demand
+      buyDrought: (() => {
+        const bd = (position.buy_drought ?? {}) as Record<string, unknown>;
+        return {
+          enabled: (bd.enabled as boolean) ?? true,
+          snapshotsForTighten: (bd.snapshots_for_tighten as number) ?? 2,
+          sellCountForTighten: (bd.sell_count_for_tighten as number) ?? 5,
+          tightenTrailingPct: (bd.tighten_trailing_pct as number) ?? 5,
+          snapshotsForEmergency: (bd.snapshots_for_emergency as number) ?? 3,
+          sellCountForEmergency: (bd.sell_count_for_emergency as number) ?? 10,
+        };
+      })(),
     },
     risk: {
       maxPositionSol: (risk.max_position_sol as number) ?? 0.15,
@@ -173,6 +210,7 @@ export function loadConfig(): BotConfig {
       shadowMaxConcurrent: (risk.shadow_max_concurrent as number) ?? 20,
       shadowTimeoutMinutes: (risk.shadow_timeout_minutes as number) ?? 15,
       shadowPollMs: (risk.shadow_poll_ms as number) ?? 5000,
+      pauseOnRug: envBool('PAUSE_ON_RUG', (risk.pause_on_rug as boolean) ?? false),
     },
     copyTrading: {
       enabled: (copyTrading.enabled as boolean) ?? false,

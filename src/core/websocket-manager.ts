@@ -82,7 +82,8 @@ export class WebSocketManager {
   }
 
   startHeartbeat(intervalMs = 30_000): void {
-    // v11k DIAGNOSTIC: Log WS message rate every 10s
+    // v11k DIAGNOSTIC: Log WS message rate
+    // v11u: 10s → 60s, info → debug (was 10% of all logs with zero actionability)
     this.wsMsgInterval = setInterval(() => {
       const parts: string[] = [];
       for (const [id, count] of this.wsMsgCounts) {
@@ -90,10 +91,10 @@ export class WebSocketManager {
       }
       if (parts.length > 0) {
         const total = [...this.wsMsgCounts.values()].reduce((a, b) => a + b, 0);
-        logger.info(`[ws] MSG RATE (10s): ${parts.join(', ')} | total=${total} (${(total / 10).toFixed(0)}/s)`);
+        logger.debug(`[ws] MSG RATE (60s): ${parts.join(', ')} | total=${total} (${(total / 60).toFixed(0)}/s)`);
       }
       this.wsMsgCounts.clear();
-    }, 10_000);
+    }, 60_000);
 
     this.heartbeatInterval = setInterval(async () => {
       const now = Date.now();

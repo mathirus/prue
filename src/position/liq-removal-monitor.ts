@@ -108,9 +108,13 @@ export class LiquidityRemovalMonitor {
           );
 
           // v11m: Detect buys for buy/sell ratio tracking
-          const isBuy = !isRemoveLiq && !isSuspiciousSell && logs.logs.some(
+          // v11s fix: Buy detection is independent of sell detection.
+          // PumpSwap logs can contain both "Sell" and "Buy" patterns in the same TX,
+          // so gating on !isSuspiciousSell caused buy_count to always be 0.
+          const isBuy = !isRemoveLiq && logs.logs.some(
             (line) =>
-              line.includes('Instruction: Buy') || line.includes('Instruction: BuyExactIn'),
+              (line.includes('Instruction: Buy') || line.includes('Instruction: BuyExactIn'))
+              && !line.includes('Sell'), // Ensure it's a buy-only instruction line
           );
           if (isBuy) {
             const buyTimestamps = this.buyTracker.get(poolStr) ?? [];
